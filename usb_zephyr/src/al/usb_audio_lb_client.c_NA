@@ -1,0 +1,1185 @@
+
+#include <stringl/stringl.h>  // For memscpy
+#include "usb_api.h"
+#include "usb_hid_api.h"
+#include "usb_audio.h"
+#include "usb_mock_client_wrapper.h"
+#include "usb_log.h"
+
+#include "usb_util.h"
+#include "usb_urb.h"
+#include "lists.h"
+#include "comdef.h"           // common defines - basic types as byte word uint32 etc
+#include "timer.h"
+#include "busywait.h"
+
+#include "qurt_signal2.h"
+#include "qurt_thread.h"
+#include "qurt_error.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include "qurt.h"
+
+#include <xtensa/core-macros.h> //MEM cache_invalid
+#include "memheap_lite.h"   //Memalign
+
+#define USB_AUDIO_LB_THREAD_STACK_SIZE (1024)
+
+qurt_thread_t usb_audio_lb_id;
+qurt_signal2_t usb_audio_lb_sigs; 
+qurt_signal2_t* usb_audio_lb_sigs_ptr; 
+uint8_t* usb_audio_lb_stack;
+
+#ifdef USB_HID_TEST
+#define USB_HID_THREAD_STACK_SIZE (1024)
+uint8_t* usb_hid_stack;
+qurt_signal2_t usb_hid_sigs; 
+qurt_signal2_t* usb_hid_ptr; 
+qurt_thread_t usb_hid_id;
+#endif
+
+#define USB_AUDIO_EVT_DATA_SIZE   (128)
+#define USB_BYTE_SIZE_4K          (4096)
+#define USB_AUDIO_LB_REQ_NUM      (5)
+#define USB_AUDIO_LB_STREAM_NUM   (2)
+#define AUDIO_CLASS_REV           (USB_AUDIO_CLASS_REV_2)
+#define HZ_TO_BIN_8_24(freq)      ((((freq) / 8000) << 24) | ((freq) % 8000))
+
+#define USB_COMPLETE_TIMER_SEC    (2)
+
+#define MAX_FU_CTRLS                      (2)
+
+// Note: numbers here are signed
+#define AUDIO_VOLUME_MIN                  (0x8100)
+#define AUDIO_VOLUME_DEFAULT              (0xC100)
+#define AUDIO_VOLUME_MAX                  (0x0000)
+#define AUDIO_VOLUME_RES                  (0x0100)
+#define AUDIO_MUTE_ON                     (0x1)
+#define AUDIO_MUTE_OFF                    (0x0)
+
+typedef PACKED struct audio_vol_range
+{
+  uint16 n_range;
+  uint16 vol_min;
+  uint16 vol_max;
+  uint16 vol_res;  
+} PACKED_POST audio_vol_range_t;
+
+typedef struct audio_controls_fu
+{
+  uint8 unit_id;
+  uint8 n_ch;
+  uint8 mute[3];
+  uint16 volume[3];  // master + 2 channels
+  audio_vol_range_t volume_range;
+} audio_controls_fu_t;
+
+audio_controls_fu_t audio_fu_controls[MAX_FU_CTRLS] = 
+{
+  // st_rx_fu controls
+  {                         
+    2,                      //unit_id
+    2,                      //n_ch
+    { //mute
+      AUDIO_MUTE_OFF,       // master  
+      AUDIO_MUTE_OFF,       // ch1
+      AUDIO_MUTE_OFF,       // ch2
+     },
+
+    { //volume
+      AUDIO_VOLUME_DEFAULT, // master
+      AUDIO_VOLUME_DEFAULT, //ch1
+      AUDIO_VOLUME_DEFAULT, //ch2
+    },
+    
+    { //vol_range
+      1,                    // n_range
+      AUDIO_VOLUME_MIN,     // vol_min
+      AUDIO_VOLUME_MAX,     // vol_max
+      AUDIO_VOLUME_RES,     // vol_res
+    }
+  },
+
+  // voice_mic_fu controls
+  // st_rx_fu controls
+  {                         
+    5,                      //unit_id
+    1,                      //n_ch
+    { //mute
+      AUDIO_MUTE_OFF,       // master  
+      AUDIO_MUTE_OFF,       // ch1
+      AUDIO_MUTE_OFF,       // ch2
+     },
+
+
+    { //volume
+      AUDIO_VOLUME_DEFAULT, // master
+      AUDIO_VOLUME_DEFAULT, //ch1
+      AUDIO_VOLUME_DEFAULT, //ch2
+    },
+    
+    { //vol_range
+      1,                    // n_range
+      AUDIO_VOLUME_MIN,     // vol_min
+      AUDIO_VOLUME_MAX,     // vol_max
+      AUDIO_VOLUME_RES,     // vol_res
+    }
+  },
+};
+
+typedef struct
+{
+  //usb_timer_client_id_type client_id;
+  boolean timer_running;
+  timer_type timer;
+  timer_group_ptr timer_group;
+  timetick_type timer_val;
+
+  uint32  feature_mask;
+  boolean is_allocated; /* indicates whether the timer slot is in allocated or in use */
+
+  timer_t1_cb_type usr_cb;
+  timer_cb_data_type usr_data;
+
+  uint32 duplicate_entry_count;
+} usb_timer_type;
+
+typedef enum
+{
+  USB_AUDIO_EVENT_SIG      = 0x01,
+  USB_AUDIO_STATUS_SIG     = 0x02,
+} usb_client_signal_type;
+
+#ifdef USB_HID_TEST
+uint32 USB_HID_START_SIG        = 0x04;
+#endif
+
+typedef enum
+{
+USB_AUDIO_LB_STREAM_SPEAKER,
+  USB_AUDIO_LB_STREAM_MIC,
+  
+} usb_audio_lb_stream_type;
+
+typedef struct
+{
+  uint64 req_cnt; 
+  client_ctx_t* usb_ctx;
+  usb_audio_stream_cfg usb_cfg;
+  uint32 req_size;
+  client_request_t* req[USB_AUDIO_LB_REQ_NUM];
+} usb_audio_lb_stream;
+
+typedef struct usb_audio_lb_event
+{
+  TAILQ_ENTRY(usb_audio_lb_event)  next;
+  uint32 event;
+  void* data;
+  uint32 size;
+} usb_audio_lb_event_t;
+
+typedef struct 
+{
+  usblock_t evt_q_lock;
+  TAILQ_HEAD(event_q, usb_audio_lb_event) evt_q;
+  TAILQ_HEAD(event_q_pool, usb_audio_lb_event) evt_q_pool;
+  usb_audio_ctrl_cfg* ctrl_cfg;
+
+  // Intermediate buffer shared between mic and speaker path
+  usblock_t intmd_lock;
+  buff_ring_t intmd_ring;
+  uint32 intmd_buff_size;
+  boolean wrap_toggle;
+  uint32 intmd_pending_bytes;
+  usb_audio_lb_stream stream[USB_AUDIO_LB_STREAM_NUM];
+} usb_audio_lb_ctx;
+
+usb_audio_lb_ctx* audio_lb_ctx;
+
+client_ctx_t* usb_hid_client_ctx;
+
+boolean usb_audio_lb_ctrl_get_req (uint32 client_id, audio_node_t* node, 
+  audio_ctrl_t ctrl, audio_req_t req, audio_ch_t ch, uint32* buff, uint32* len)
+{
+  uint8 i;
+  audio_controls_fu_t* fu_controls = NULL;
+
+  if(NULL == node || NULL == buff)
+  {
+    return FALSE;
+  }
+
+  if(node->val.type == AUDIO_FEATURE_UNIT)
+  {
+    for(i = 0; i < MAX_FU_CTRLS; i++)
+    {
+      if (node->val.id == audio_fu_controls[i].unit_id)
+      {
+        fu_controls = &audio_fu_controls[i];
+      }
+    }
+
+    if (fu_controls)
+    {
+      switch(ctrl)
+      {
+        case AUDIO_CTRL_FU_MUTE:
+        {
+          if(req == AUDIO_REQ_CURR)
+          {
+            *len = 1;
+            *((uint8*)buff) = fu_controls->mute[ch];
+            return TRUE;
+          }
+        }
+        break;
+      
+        case AUDIO_CTRL_FU_VOLUME:
+        {
+          switch (req)
+          {
+            case AUDIO_REQ_CURR:
+              *len = 2;
+              *((uint16*)buff) = fu_controls->volume[ch];
+            return TRUE;
+
+            case AUDIO_REQ_MIN:
+                *len = 2;
+                *((uint16*)buff) = fu_controls->volume_range.vol_min;
+              return TRUE;
+
+            case AUDIO_REQ_MAX:
+                *len = 2;
+                *((uint16*)buff) = fu_controls->volume_range.vol_max;
+              return TRUE;
+
+            case AUDIO_REQ_RES:
+                *len = 2;
+                *((uint16*)buff) = fu_controls->volume_range.vol_res;
+              return TRUE;
+
+            case AUDIO_REQ_RANGE:
+              *len = sizeof(audio_vol_range_t);
+              *((audio_vol_range_t*)buff) = fu_controls->volume_range;
+            return TRUE;
+          }
+        }
+        break;
+
+        default:
+          USB_ULOG(BAM_QLOG, "unknown control");
+      }
+    }
+  }
+  return FALSE;
+}
+
+boolean usb_audio_lb_ctrl_set_req (uint32 client_id, audio_node_t* node, 
+  audio_ctrl_t ctrl, audio_req_t req, audio_ch_t ch, uint32* buff, uint32 len)
+{
+  uint8 i;
+  audio_controls_fu_t* fu_controls = NULL;
+
+  if(NULL == node || NULL == buff)
+  {
+    return FALSE;
+  }
+
+  if(node->val.type == AUDIO_FEATURE_UNIT)
+  {
+    for(i = 0; i < MAX_FU_CTRLS; i++)
+    {
+      if (node->val.id == audio_fu_controls[i].unit_id)
+      {
+        fu_controls = &audio_fu_controls[i];
+      }
+    }
+
+    if (fu_controls)
+    {
+      switch(ctrl)
+      {
+        case AUDIO_CTRL_FU_MUTE:
+        {
+          if(req == AUDIO_REQ_CURR)
+          {
+            fu_controls->mute[ch] = *((uint8*)buff);
+            return TRUE;
+          }
+        }
+        break;
+      
+        case AUDIO_CTRL_FU_VOLUME:
+        {
+          if (req == AUDIO_REQ_CURR)
+          {
+            fu_controls->volume[ch] = *((uint16*)buff);
+            return TRUE;
+          }
+        }
+        break;
+      
+        default:
+          USB_ULOG(BAM_QLOG, "unknown control");
+      }
+    }
+  }
+  return FALSE;
+}
+
+
+
+uint32 audio_calc_transfer_size(uint32 freq, uint8 n_ch, uint8 bps, uint32 interval_us)
+{
+  uint32 size;
+  size = (freq  * n_ch * bps * interval_us) / (1000 * 1000);
+  return size;
+}
+
+void usb_audio_lb_stream_enable(usb_audio_lb_stream* stream, usb_audio_stream_cfg* usb_cfg)
+{
+  uint8 i;
+  client_request_t* req;
+  stream->usb_cfg = *usb_cfg;
+  stream->req_cnt = 0;
+
+  USB_ULOG_2(BAM_QLOG, "stream id %d, ifc_id %d", stream->usb_cfg.client_id, stream->usb_cfg.ifc_id);
+  USB_LOG_1(log_usb_audio_lb_stream_enable__ifc_id_D, stream->usb_cfg.ifc_id);
+
+  stream->req_size = audio_calc_transfer_size(stream->usb_cfg.freq, stream->usb_cfg.n_ch, 
+    stream->usb_cfg.bytes_per_sample, (125 * stream->usb_cfg.interval));
+
+  USB_ASSERT(stream->req_size <= stream->usb_cfg.max_buff_size); 
+
+  for (i=0; i < USB_AUDIO_LB_REQ_NUM; i++)
+  {
+    if (NULL == stream->req[i])
+    {
+      USB_ASSERT(stream->req[i] = (client_request_t*)usb_fn_mem_util()->usb_malloc(sizeof(client_request_t)));
+      if (NULL == stream->req[i]->buf_ptr)
+      {        
+        USB_ASSERT(stream->req[i]->buf_ptr = usb_fn_mem_util()->usb_malloc_uncached(stream->usb_cfg.max_buff_size));
+      }
+    }
+
+    req = stream->req[i];
+    req->req_id = ++stream->req_cnt;
+    req->status = USB_REQ_QUEUED;
+
+    switch (stream->usb_cfg.ifc_id)
+    {
+      case USB_IFC_ID_AUDIO_STREAMING_MIC:
+      {
+        req->type = USB_WRITE_REQ;
+        req->size = stream->req_size;
+        usb_api()->usb_isoc_in(stream->usb_ctx, req->buf_ptr, req->size, stream);
+      }
+      break;
+
+      case USB_IFC_ID_AUDIO_STREAMING_SPEAKER:
+      {
+        req->type = USB_READ_REQ;
+        req->size = stream->usb_cfg.max_buff_size;
+        usb_api()->usb_isoc_out(stream->usb_ctx, req->buf_ptr, req->size, stream);
+      }
+      break;
+      default:
+      {
+        USB_ULOG_1(DBG_E_QLOG, "wrong ifc id %d", stream->usb_cfg.ifc_id);
+        USB_LOG_ERR_1(log_usb_audio_lb_stream_enable__wrong_ifc_D, stream->usb_cfg.ifc_id);
+        
+      }
+      break;
+    }
+  }
+}
+
+void usb_audio_lb_stream_disable(usb_audio_lb_stream* stream, usb_audio_stream_cfg* cfg)
+{
+  uint8 i;
+  stream->usb_cfg.client_id = 0;
+  USB_ULOG_2(BAM_QLOG, "stream id %d, ifc_id %d", stream->usb_cfg.client_id, stream->usb_cfg.ifc_id);
+
+  for (i=0; i < USB_AUDIO_LB_REQ_NUM; i++)
+  {
+    if (stream->req[i])
+    {
+      if (stream->req[i]->buf_ptr)
+      {
+        usb_fn_mem_util()->usb_free((void**)&stream->req[i]->buf_ptr);
+      }
+      usb_fn_mem_util()->usb_free((void**)&stream->req[i]);
+    }
+  }
+}
+
+usb_audio_lb_event_t* usb_audio_lb_alloc_event(uint32 event, void* data, uint32 size)
+{
+  usb_audio_lb_event_t* evt;
+
+  evt = TAILQ_FIRST(&audio_lb_ctx->evt_q_pool);
+  if (evt == NULL)
+  {
+    USB_ASSERT(evt = (usb_audio_lb_event_t*)usb_fn_mem_util()->usb_malloc(sizeof(usb_audio_lb_event_t)));
+    USB_ASSERT(evt->data = usb_fn_mem_util()->usb_malloc(USB_AUDIO_EVT_DATA_SIZE));
+  }
+  else
+  {
+    TAILQ_REMOVE(&audio_lb_ctx->evt_q_pool, evt, next);
+  }
+
+  if (size && data)
+  {
+    memscpy(evt->data, size, data, size);
+    evt->size = size;
+  }
+  evt->event = event;
+  return evt;
+}
+
+void usb_audio_lb_free_event(usb_audio_lb_event_t* evt)
+{
+  evt->size = 0;
+  TAILQ_INSERT_TAIL(&audio_lb_ctx->evt_q_pool, evt, next);
+}
+
+void usb_audio_lb_event_cb(uint32 event, void* data)
+{
+  usb_audio_lb_event_t* evt;
+  uint32 size = 0;
+
+  USB_ULOG_2(BAM_QLOG, "event %d, data 0x%x", event, (uint32)data);
+  USB_LOG_DBG_1(log_usb_audio_lb_event_cb__event_D, event);
+
+  switch(event)
+  {
+    case USB_EVENT_STREAM_ENABLE:
+    case USB_EVENT_STREAM_DISABLE:
+    {
+      size = sizeof(usb_audio_stream_cfg);
+    }
+    break;
+
+    case USB_EVENT_AUDIO_CTRL_CFG:
+    {
+      size = sizeof(usb_audio_ctrl_cfg);
+    }
+    break;
+  }
+
+  usblock_lock(&audio_lb_ctx->evt_q_lock);
+  evt = usb_audio_lb_alloc_event(event, data, size);
+  TAILQ_INSERT_TAIL(&audio_lb_ctx->evt_q, evt, next);
+  usblock_unlock(&audio_lb_ctx->evt_q_lock);
+  qurt_signal2_set(usb_audio_lb_sigs_ptr, USB_AUDIO_EVENT_SIG);
+}
+
+static void usb_enq_intmd_buffer(usb_audio_lb_ctx* pipe_h, uint8* input_buff, uint32 size)
+{
+  uint32 size_temp;
+  // USB_ULOG_2(BAM_QLOG, "size %d, enq 0x%x", size, (uint32)pipe_h->intmd_ring.enqueue);
+
+  if (pipe_h->wrap_toggle)
+  {
+    if ((pipe_h->intmd_ring.enqueue + size) <= pipe_h->intmd_ring.dequeue)
+    {
+      memscpy((void *)pipe_h->intmd_ring.enqueue, size, input_buff, size);
+      pipe_h->intmd_ring.enqueue += size;
+    }
+    else
+    {
+      USB_ULOG(BAM_QLOG, "Out of intmd buffer");
+      USB_ERR_FATAL("Out of intmd buffer", 0, 0, 0);
+    }
+  }
+  else
+  {
+    if ((pipe_h->intmd_ring.enqueue + size) <= pipe_h->intmd_ring.end)
+    {
+      memscpy((void *)pipe_h->intmd_ring.enqueue, size, input_buff, size);
+      pipe_h->intmd_ring.enqueue += size;
+    }
+    else
+    {
+      size_temp = pipe_h->intmd_ring.end - pipe_h->intmd_ring.enqueue;
+      if (pipe_h->intmd_ring.begin + (size-size_temp) <= pipe_h->intmd_ring.dequeue)
+      { 
+        memscpy((void *)pipe_h->intmd_ring.enqueue, size_temp, input_buff, size_temp);
+        pipe_h->wrap_toggle = TRUE;
+        pipe_h->intmd_ring.enqueue = pipe_h->intmd_ring.begin;
+        memscpy((void *)pipe_h->intmd_ring.enqueue, (size-size_temp), (input_buff+size_temp), (size-size_temp));
+        pipe_h->intmd_ring.enqueue += (size-size_temp);
+      }
+      else
+      {
+        USB_ULOG(BAM_QLOG, "Out of intmd buffer");
+        USB_ERR_FATAL("Out of intmd buffer", 0, 0, 0);
+      }
+    }
+  }
+  pipe_h->intmd_pending_bytes += size;
+}
+
+static void usb_deq_intmd_buffer(usb_audio_lb_ctx* pipe_h, uint8* output_buff, uint32 size)
+{
+  uint32 size_temp;
+  USB_ULOG_2(DATA_QLOG, "size %d, deq 0x%x", size, (uint32)pipe_h->intmd_ring.dequeue);
+
+
+  if (pipe_h->wrap_toggle)
+  {
+    if ((pipe_h->intmd_ring.dequeue + size) <= pipe_h->intmd_ring.end)
+    {
+      memscpy((void*)output_buff, size, (void *)pipe_h->intmd_ring.dequeue, size);
+      pipe_h->intmd_ring.dequeue += size;
+    }
+    else
+    {
+      size_temp = pipe_h->intmd_ring.end - pipe_h->intmd_ring.dequeue;
+      if ((pipe_h->intmd_ring.begin + (size-size_temp)) <= pipe_h->intmd_ring.enqueue)
+      { 
+        memscpy((void*)output_buff, size_temp, (void *)pipe_h->intmd_ring.dequeue, size_temp);
+        pipe_h->wrap_toggle = FALSE;
+        pipe_h->intmd_ring.dequeue = pipe_h->intmd_ring.begin;
+        memscpy((void*)(output_buff+size_temp), (size-size_temp), (void *)pipe_h->intmd_ring.dequeue, (size-size_temp));
+        pipe_h->intmd_ring.dequeue += (size-size_temp);
+      }
+      else
+      {
+        USB_ULOG(BAM_QLOG, "Out of intmd buffer");
+        USB_ERR_FATAL("Out of intmd buffer", 0, 0, 0);
+      }
+    }  
+  }
+  else
+  {
+    if ((pipe_h->intmd_ring.dequeue + size) <= pipe_h->intmd_ring.enqueue)
+    {
+      memscpy((void*)output_buff, size, (void *)pipe_h->intmd_ring.dequeue, size);
+      pipe_h->intmd_ring.dequeue += size;
+    }
+    else
+    {
+      USB_ULOG(BAM_QLOG, "Out of intmd buffer");
+      USB_ERR_FATAL("Out of intmd buffer", 0, 0, 0);
+    }
+  }
+  pipe_h->intmd_pending_bytes -= size;
+}
+
+static void usb_deq_overwrite(usb_audio_lb_ctx* pipe_h, uint32 size)
+{
+  uint32 size_temp;
+  USB_ULOG_2(BAM_QLOG, "size %d, deq 0x%x", size, (uint32)pipe_h->intmd_ring.dequeue);
+
+
+  if (pipe_h->wrap_toggle)
+  {
+    if ((pipe_h->intmd_ring.dequeue + size) <= pipe_h->intmd_ring.end)
+    {
+      pipe_h->intmd_ring.dequeue += size;
+    }
+    else
+    {
+      size_temp = pipe_h->intmd_ring.end - pipe_h->intmd_ring.dequeue;
+      if ((pipe_h->intmd_ring.begin + (size-size_temp)) <= pipe_h->intmd_ring.enqueue)
+      { 
+        pipe_h->wrap_toggle = FALSE;
+        pipe_h->intmd_ring.dequeue = pipe_h->intmd_ring.begin;
+        pipe_h->intmd_ring.dequeue += (size-size_temp);
+      }
+      else
+      {
+        USB_ULOG(BAM_QLOG, "Out of intmd buffer");
+        USB_ERR_FATAL("Out of intmd buffer", 0, 0, 0);
+      }
+    }  
+  }
+  else
+  {
+    if ((pipe_h->intmd_ring.dequeue + size) <= pipe_h->intmd_ring.enqueue)
+    {
+      pipe_h->intmd_ring.dequeue += size;
+    }
+    else
+    {
+      USB_ULOG(BAM_QLOG, "Out of intmd buffer");
+      USB_ERR_FATAL("Out of intmd buffer", 0, 0, 0);
+    }
+  }
+  pipe_h->intmd_pending_bytes -= size;
+}
+
+uint32 usb_audio_spk_fb_freq_cb(uint32 client_id)
+{
+  uint8 i;
+  uint32 ff_bin_8_24;
+  for(i=0; i<USB_AUDIO_LB_STREAM_NUM; i++)
+  {
+    if(audio_lb_ctx->stream[i].usb_ctx && (audio_lb_ctx->stream[i].usb_ctx->client_id == client_id))
+    {
+      ff_bin_8_24 = HZ_TO_BIN_8_24(audio_lb_ctx->stream[i].usb_cfg.freq);
+      return ff_bin_8_24;
+    }
+  }
+  return 0;
+}
+
+void usb_audio_lb_tx_cb(uint8* buf_ptr, uint32 size, uint32 status, void* cb_data)
+{
+  usb_audio_lb_stream* stream = (usb_audio_lb_stream*) cb_data;
+  uint32 new_size;
+  USB_ASSERT(buf_ptr);  
+
+  if (USB_REQ_CANCEL == status)
+  {
+    USB_ULOG_2(DATA_QLOG, "tx_req_cancel, buf_ptr 0x%X, req_id %u", (uint32) buf_ptr, 
+      (uint32) stream->req_cnt);
+    USB_LOG_DBG(log_usb_audio_lb_tx_cb__cancel);
+  }
+  else
+  {
+    USB_ULOG_3(DATA_QLOG, "sent, bytes %d, buf_ptr 0x%X, req_id %u", size, 
+      (uint32) buf_ptr, (uint32) stream->req_cnt);
+    USB_LOG_DBG_1(log_usb_audio_lb_tx_cb__size_D, size);
+
+    USB_ASSERT(size <= stream->usb_cfg.max_buff_size);
+
+    new_size = stream->req_size;
+    stream->req_cnt++;
+
+    usblock_lock(&audio_lb_ctx->intmd_lock);
+    if (audio_lb_ctx->intmd_pending_bytes > new_size)
+    {
+      usb_deq_intmd_buffer(audio_lb_ctx, buf_ptr, new_size);
+    }
+    else
+    {
+      // send a silence packet
+      memset(buf_ptr, 0, new_size);
+    }
+    usblock_unlock(&audio_lb_ctx->intmd_lock);
+    usb_api()->usb_isoc_in(stream->usb_ctx, buf_ptr, new_size, stream);
+  }
+}
+
+void usb_audio_lb_rx_cb(uint8* buf_ptr, uint32 size, uint32 status, void* cb_data)
+{
+  usb_audio_lb_stream* stream = (usb_audio_lb_stream*) cb_data;
+  uint32 i;
+  uint32 num_samples;
+  uint32 enq_size;
+  uint32 new_size;
+
+  USB_ASSERT(buf_ptr);
+
+  if (USB_REQ_CANCEL == status)
+  {
+    USB_ULOG_2(BAM_QLOG, "rx_req_cancel, buf_ptr 0x%X, req_id %u", (uint32) buf_ptr, 
+      (uint32)stream->req_cnt);
+    USB_LOG_DBG(log_usb_audio_lb_rx_cb__cancel);
+  }
+  else
+  {
+    USB_ULOG_3(BAM_QLOG, "received, bytes %d, buf_ptr 0x%X, req_id %u", size, 
+      (uint32) buf_ptr, (uint32)stream->req_cnt);
+    USB_LOG_DBG_1(log_usb_audio_lb_rx_cb__size_D, size);
+    USB_ASSERT(size <= stream->usb_cfg.max_buff_size);
+
+    usblock_lock(&audio_lb_ctx->intmd_lock);
+
+    // Since microphone has only one channel, strip one channel worth of data while enqueing to intmd.
+    num_samples = (size / stream->usb_cfg.bytes_per_sample) / stream->usb_cfg.n_ch;
+    enq_size    = (size / stream->usb_cfg.n_ch);
+
+    if ((audio_lb_ctx->intmd_pending_bytes + enq_size) > audio_lb_ctx->intmd_buff_size)
+    {
+      usb_deq_overwrite(audio_lb_ctx, enq_size);
+    }
+
+    for (i = 0; i < num_samples; i++)
+    {
+      usb_enq_intmd_buffer(audio_lb_ctx, 
+        ((uint8*)buf_ptr + (stream->usb_cfg.bytes_per_sample * stream->usb_cfg.n_ch * i)), 
+        stream->usb_cfg.bytes_per_sample);
+    }
+    USB_ULOG_2(BAM_QLOG, "enq_size %d, pending_bytes %d",  enq_size, audio_lb_ctx->intmd_pending_bytes);
+    usblock_unlock(&audio_lb_ctx->intmd_lock);
+
+    // req->type = USB_READ_REQ;
+    new_size = stream->usb_cfg.max_buff_size;
+    stream->req_cnt++;
+    usb_api()->usb_isoc_out(stream->usb_ctx, buf_ptr, new_size, stream);
+  }
+}
+
+#define ATS_BUFF_SIZE      (64)
+uint8 ats_buff_rx[ATS_BUFF_SIZE];
+
+boolean ats_out_cb(usb_setup_t* cmd_ptr, uint8* payload, uint32 payload_size)
+{
+  USB_ULOG_1(BAM_QLOG, "Audio Tune RX, payload_size %d", payload_size);
+  USB_ASSERT(payload_size <= ATS_BUFF_SIZE);
+  if(cmd_ptr->length == payload_size)
+  {
+    memscpy((void*)(ats_buff_rx), ATS_BUFF_SIZE, payload, payload_size);
+    return TRUE;
+  }
+  return FALSE;
+}
+
+boolean ats_in_cb(usb_setup_t* cmd_ptr, uint8* payload, uint32* payload_size)
+{
+  *payload_size = cmd_ptr->length;
+  USB_ULOG_1(BAM_QLOG, "Audio Tune TX, payload_size %d", *payload_size); 
+  memscpy((void*)payload , (*payload_size), &ats_buff_rx[0], ATS_BUFF_SIZE);
+  return TRUE;
+}
+#ifdef USB_HID_TEST_TX_CB
+#define USB_CLI_HID_MAX_SIZE (5)
+usb_hid_buff_t* usb_cli_hid_buff;
+uint32 usb_cli_last_idx =0;  //quick optimization
+
+void usb_cli_hid_event_cb(uint32 event, void* data)
+{
+
+}
+void usb_cli_hid_rx_cb(uint8* buf_ptr, uint32 size, uint32 status, void* cb_data)
+{
+
+}
+
+void usb_cli_hid_tx_cb(uint8* buf_ptr, uint32 size, uint32 status, void* cb_data)
+{
+  usb_hid_buff_t* hid_ptr = (usb_hid_buff_t*)buf_ptr;
+
+  if (status == USB_REQ_COMPLETE_OK)
+  {
+    hid_ptr->report_id =0;
+  }
+}
+#endif
+
+usb_ifc_id* usb_comp;
+uint8 usb_comp_num_ifc;
+usb_dev_params_t usb_params;
+usb_audio_stream_open_cfg_t speaker_open_cfg;
+usb_audio_stream_open_cfg_t mic_open_cfg;
+usb_audio_ctrl_open_cfg_t usb_audio_control_cfg;
+
+void usb_audio_lb_main (void* arg)
+{
+  uint32 signal_received;
+  uint32 usb_sig_rec;
+  uint8 i;
+  ctrl_client_ctx_t* usb_ats_ctx; // audio tuning service 
+  client_ctx_t* usb_audio_ctrl_ctx;
+  client_ctx_t* usb_mic_ctx;
+  client_ctx_t* usb_speaker_ctx;
+  client_ctx_t* usb_hid_ctx;
+  usb_audio_lb_event_t* evt;
+
+
+  usb_api()->usb_thread_init(&(usb_audio_lb_sigs));
+  USB_LOG_DBG(log_usb_audio_lb_main__init);
+
+
+  USB_ASSERT(audio_lb_ctx = (usb_audio_lb_ctx*)usb_fn_mem_util()->usb_malloc(sizeof(usb_audio_lb_ctx)));
+  TAILQ_INIT(&audio_lb_ctx->evt_q);
+  TAILQ_INIT(&audio_lb_ctx->evt_q_pool);
+  usblock_init(&audio_lb_ctx->evt_q_lock);
+
+  // INTMD ring init
+  usblock_init(&audio_lb_ctx->intmd_lock);
+  audio_lb_ctx->intmd_buff_size = (4 * USB_BYTE_SIZE_4K);
+  audio_lb_ctx->intmd_pending_bytes = 0;
+  audio_lb_ctx->wrap_toggle = FALSE;
+  USB_ASSERT(audio_lb_ctx->intmd_ring.begin = (uint8*)usb_fn_mem_util()->usb_malloc(audio_lb_ctx->intmd_buff_size));
+  audio_lb_ctx->intmd_ring.enqueue = audio_lb_ctx->intmd_ring.begin;
+  audio_lb_ctx->intmd_ring.dequeue = audio_lb_ctx->intmd_ring.begin;
+  audio_lb_ctx->intmd_ring.end = audio_lb_ctx->intmd_ring.begin + audio_lb_ctx->intmd_buff_size;
+
+
+  USB_ULOG_3(BAM_QLOG, "intmd_ring begin 0x%8x, end 0x%8x, enq_deq 0x%8x",
+    (uint32)audio_lb_ctx->intmd_ring.begin,(uint32)audio_lb_ctx->intmd_ring.end, 
+    (uint32)audio_lb_ctx->intmd_ring.enqueue);
+
+  // TODO: read usb_params from ACDB
+  usb_params.qc_pid = USB_PID_UAC2_HEADSET;
+  usb_params.vid_override = 0;
+  usb_params.pid_override = 0;
+  usb_params.audio_profile = USB_AUDIO_HEADSET;
+  usb_params.top_aud_rev = USB_AUDIO_CLASS_REV_3;
+  usb_params.n_mic = 1;
+  usb_api()->usb_set_params(&usb_params, &usb_comp, &usb_comp_num_ifc);
+
+  // Register audio tuning service with USB.
+  usb_api()->usb_open_ctrl(&usb_ats_ctx, USB_IFC_ID_AUDIO_TUNING, ats_out_cb, ats_in_cb);
+
+  for(i =0; i < usb_comp_num_ifc; i++)
+  {
+    switch(usb_comp[i])
+    {
+      case USB_IFC_ID_AUDIO_CONTROL:
+      { 
+        usb_audio_control_cfg.clock_mode = USB_AUDIO_CLOCK_MODE_SINGLE;
+        usb_audio_control_cfg.get_req = &usb_audio_lb_ctrl_get_req;
+        usb_audio_control_cfg.set_req = &usb_audio_lb_ctrl_set_req; 
+        usb_api()->usb_open_audio_ctrl(&usb_audio_ctrl_ctx, usb_comp[i], &usb_audio_control_cfg, 
+          usb_audio_lb_event_cb);
+        USB_ASSERT(usb_audio_ctrl_ctx);
+      }
+      break;
+
+      case USB_IFC_ID_AUDIO_STREAMING_MIC:
+      {
+        // TODO: read as_freq and as_bus_cfg[8] from ACDB
+        mic_open_cfg.as_freq = AS_FREQ_44p1_k | AS_FREQ_48_k | AS_FREQ_96_k | AS_FREQ_192_k;
+        mic_open_cfg.as_bus_cfg[0] = (AS_BW_SLOT_CFG_16_2 << 4) | AS_SVC_INT_US_1000;
+        mic_open_cfg.as_bus_cfg[1] = (AS_BW_SLOT_CFG_24_3 << 4) | AS_SVC_INT_US_1000;
+        mic_open_cfg.as_bus_cfg[2] = (AS_BW_SLOT_CFG_32_4 << 4) | AS_SVC_INT_US_1000;
+        mic_open_cfg.as_bus_cfg[3] = (AS_BW_SLOT_CFG_NONE << 4) | AS_SVC_INT_US_NONE;
+        mic_open_cfg.as_bus_cfg[4] = (AS_BW_SLOT_CFG_NONE << 4) | AS_SVC_INT_US_NONE;
+        mic_open_cfg.as_bus_cfg[5] = (AS_BW_SLOT_CFG_NONE << 4) | AS_SVC_INT_US_NONE;        
+        mic_open_cfg.as_bus_cfg[6] = (AS_BW_SLOT_CFG_NONE << 4) | AS_SVC_INT_US_NONE;
+        mic_open_cfg.as_bus_cfg[7] = (AS_BW_SLOT_CFG_NONE << 4) | AS_SVC_INT_US_NONE;
+        mic_open_cfg.get_expl_fb_freq = NULL;
+        usb_api()->usb_open_audio_stream(&usb_mic_ctx, usb_comp[i],
+          (void *)&mic_open_cfg, usb_audio_lb_event_cb, usb_audio_lb_tx_cb);
+        USB_ASSERT(usb_mic_ctx);
+      }
+      break;
+
+      case USB_IFC_ID_AUDIO_STREAMING_SPEAKER:
+      {
+        // TODO: read as_freq and as_bus_cfg[8] from ACDB
+        speaker_open_cfg.as_freq = AS_FREQ_44p1_k | AS_FREQ_48_k | AS_FREQ_96_k | AS_FREQ_192_k | AS_FREQ_384_k;
+        speaker_open_cfg.as_bus_cfg[0] = (AS_BW_SLOT_CFG_16_2 << 4) | AS_SVC_INT_US_1000;
+        speaker_open_cfg.as_bus_cfg[1] = (AS_BW_SLOT_CFG_24_3 << 4) | AS_SVC_INT_US_1000;
+        speaker_open_cfg.as_bus_cfg[2] = (AS_BW_SLOT_CFG_32_4 << 4) | AS_SVC_INT_US_1000;
+        speaker_open_cfg.as_bus_cfg[3] = (AS_BW_SLOT_CFG_NONE << 4) | AS_SVC_INT_US_NONE;
+        speaker_open_cfg.as_bus_cfg[4] = (AS_BW_SLOT_CFG_NONE << 4) | AS_SVC_INT_US_NONE;
+        speaker_open_cfg.as_bus_cfg[5] = (AS_BW_SLOT_CFG_NONE << 4) | AS_SVC_INT_US_NONE;
+        speaker_open_cfg.as_bus_cfg[6] = (AS_BW_SLOT_CFG_NONE << 4) | AS_SVC_INT_US_NONE;
+        speaker_open_cfg.as_bus_cfg[7] = (AS_BW_SLOT_CFG_NONE << 4) | AS_SVC_INT_US_NONE;
+        speaker_open_cfg.get_expl_fb_freq = &usb_audio_spk_fb_freq_cb;
+        usb_api()->usb_open_audio_stream(&usb_speaker_ctx, usb_comp[i],
+          (void *)&speaker_open_cfg, usb_audio_lb_event_cb, usb_audio_lb_rx_cb);
+        USB_ASSERT(usb_speaker_ctx);
+      }
+      break;
+
+      case USB_IFC_ID_HID:
+      {
+      #ifdef USB_HID_TEST_TX_CB
+        usb_api()->usb_open(&usb_hid_ctx, USB_IFC_ID_HID, NULL, usb_cli_hid_event_cb, 
+          usb_cli_hid_rx_cb, usb_cli_hid_tx_cb, 1, USB_CLI_HID_MAX_SIZE);
+      #else
+        usb_api()->usb_hid_open(&usb_hid_ctx, usb_comp[i]);
+        USB_ASSERT(usb_hid_ctx);
+      #endif
+        usb_hid_client_ctx = usb_hid_ctx;
+
+      }
+      break;
+
+      default:
+        USB_ULOG(BAM_QLOG, "unknown interface identifier");
+    }
+  }
+
+  USB_LOG_DBG(log_usb_audio_lb_main__enter_while);
+
+  while(1)
+  {
+
+     signal_received = 
+     qurt_signal2_wait(usb_audio_lb_sigs_ptr, 
+                         USB_AUDIO_EVENT_SIG | USB_HLOS_HANDLE_SIG,
+                         QURT_SIGNAL_ATTR_WAIT_ANY);
+
+    usb_sig_rec = signal_received & USB_HLOS_HANDLE_SIG;
+    if(usb_sig_rec)
+    {
+      qurt_signal2_clear(usb_audio_lb_sigs_ptr, usb_sig_rec);
+      usb_handle_signal(usb_sig_rec);
+    }
+
+    if (signal_received & USB_AUDIO_EVENT_SIG)
+    {
+      qurt_signal2_clear(usb_audio_lb_sigs_ptr, USB_AUDIO_EVENT_SIG);
+
+      usblock_lock(&audio_lb_ctx->evt_q_lock);
+      for(evt = TAILQ_FIRST(&audio_lb_ctx->evt_q); evt; evt = TAILQ_FIRST(&audio_lb_ctx->evt_q))
+      {
+        USB_ULOG_2(BAM_QLOG, "event %d, data 0x%x", (uint32)evt->event, (uint32)evt->data);
+        switch(evt->event)
+        {         
+          case USB_EVENT_AUDIO_CTRL_CFG:
+          {
+            usb_audio_ctrl_cfg* cfg = evt->data;
+            audio_lb_ctx->ctrl_cfg = cfg;
+          }
+          break;
+
+          case USB_EVENT_STREAM_ENABLE:
+          {
+            usb_audio_stream_cfg* cfg = evt->data;
+            uint8 idx;
+            USB_LOG_DBG(log_usb_audio_lb_main__stream_enable);
+
+            USB_ASSERT(cfg);
+            for(idx = 0; idx < USB_AUDIO_LB_STREAM_NUM; idx++)
+            {
+              if(audio_lb_ctx->stream[idx].usb_cfg.client_id == 0)
+              {
+                switch (cfg->ifc_id)
+                {
+                  case USB_IFC_ID_AUDIO_STREAMING_SPEAKER:
+                  {
+                    audio_lb_ctx->stream[idx].usb_ctx = usb_speaker_ctx;
+                  }
+                  break;
+                  case USB_IFC_ID_AUDIO_STREAMING_MIC:
+                  {
+                    audio_lb_ctx->stream[idx].usb_ctx = usb_mic_ctx;
+                  }
+                  break;
+                }
+                usb_audio_lb_stream_enable(&audio_lb_ctx->stream[idx], evt->data);
+                break;
+              }
+            }
+
+#ifdef USB_HID_TEST
+          qurt_signal2_set(usb_hid_ptr, USB_HID_START_SIG);
+#endif
+          }
+          break;
+
+          case USB_EVENT_STREAM_DISABLE:
+          {
+            usb_audio_stream_cfg* cfg = evt->data;
+            uint8 idx;
+            USB_LOG_DBG(log_usb_audio_lb_main__stream_disable);
+            USB_ASSERT(cfg);
+            for(idx = 0; idx < USB_AUDIO_LB_STREAM_NUM; idx++)
+            {
+              if(audio_lb_ctx->stream[idx].usb_cfg.client_id == cfg->client_id)
+              {
+                usb_audio_lb_stream_disable(&audio_lb_ctx->stream[idx], evt->data);
+                break;
+              }
+            }
+          }
+          break;
+
+          case USB_EVENT_DISCONNECT:
+          {
+            uint8 s_id;
+            uint8 i;
+            USB_LOG_DBG(log_usb_audio_lb_main__disconnect);
+            for(s_id = 0; s_id < USB_AUDIO_LB_STREAM_NUM; s_id++)
+            {
+              for (i=0; i < USB_AUDIO_LB_REQ_NUM; i++)
+              {
+                if (audio_lb_ctx->stream[s_id].req[i])
+                {
+                  usb_fn_mem_util()->usb_free((void**)&audio_lb_ctx->stream[s_id].req[i]);
+                  audio_lb_ctx->stream[s_id].req[i] = NULL;
+                }
+              }
+            }
+          }
+          break;
+        }
+        TAILQ_REMOVE(&audio_lb_ctx->evt_q, evt, next);
+        usb_audio_lb_free_event(evt);
+      }
+      usblock_unlock(&audio_lb_ctx->evt_q_lock);
+    }
+  }
+}
+
+#ifdef USB_HID_TEST
+void busywait_ms(uint32 ms)
+{
+  uint32 i;
+  for(i=0; i<ms;i++)
+  {
+    busywait(1000);
+   }
+}
+
+#ifdef USB_HID_TEST_TX_CB
+#define usb_cli_hid_report usb_cli_wrap_report
+uint32 usb_cli_hid_drop =0;
+uint32 usb_cli_wrap_report(client_ctx_t* client_ctx, usb_hid_bitmask_cmd_t report)
+{
+  uint32 cnt =0;
+  uint32 idx = usb_cli_last_idx;
+  for (cnt =0; cnt< USB_CLI_HID_MAX_SIZE; cnt++)
+  {
+    if (usb_cli_hid_buff[idx].report_id==0)
+    {
+      usb_cli_hid_buff[idx].report_id=USB_HID_REPORT_ID;
+      usb_cli_hid_buff[idx].cmd1 = report & 0x00ff;
+      usb_cli_hid_buff[idx].cmd2 = (report & 0xff00)>>8;
+      if (usb_api()->usb_write(client_ctx, (uint8*)&usb_cli_hid_buff[idx],3, 0))
+      {
+        USB_LOG_ERR_1(log_usb_cli_wrap_report__hid_fail__drop_cnt_D, ++usb_cli_hid_drop);
+        return USB_ERR_BUF_OVERFLOW;
+      }
+      usb_cli_last_idx = idx;
+      return USB_SUCCESS;
+    }
+    idx= (idx+1)%USB_CLI_HID_MAX_SIZE;
+  }
+  USB_LOG_ERR_1(log_usb_cli_wrap_report__hid_fail__drop_cnt_D, ++usb_cli_hid_drop);
+  return USB_ERR_BUF_OVERFLOW;
+}
+#else
+#define usb_cli_hid_report usb_api()->usb_hid_report
+#endif
+  
+
+uint32 usb_hid_cmd = HID_RELEASE;
+uint32 usb_hid_auto_mode = 5;
+uint32 USB_HID_DELAY = 500;
+
+void usb_hid_main (void* arg)
+{
+#ifdef USB_HID_TEST_TX_CB
+  usb_cli_last_idx=0;
+  usb_cli_hid_drop=0;
+
+  usb_cli_hid_buff = (usb_hid_buff_t*) usb_fn_mem_util()->usb_malloc_uncached(USB_CLI_HID_MAX_SIZE * sizeof(usb_cli_hid_buff));
+
+#endif
+  qurt_signal2_wait(usb_hid_ptr, USB_HID_START_SIG, QURT_SIGNAL_ATTR_WAIT_ANY);
+
+  while (1)
+  {
+    if (0==usb_hid_auto_mode)
+    {
+      usb_cli_hid_report(usb_hid_client_ctx, HID_PLAY_PAUSE);
+      busywait_ms(2000);
+
+      usb_cli_hid_report(usb_hid_client_ctx, HID_RELEASE);        
+      busywait_ms(2000);
+
+      usb_cli_hid_report(usb_hid_client_ctx, HID_VOL_INC);        
+      busywait_ms(2000);
+
+      usb_cli_hid_report(usb_hid_client_ctx, HID_RELEASE);        
+      busywait_ms(2000);   
+    }
+    else if (1==usb_hid_auto_mode)
+    {
+      usb_cli_hid_report(usb_hid_client_ctx, HID_PLAY_PAUSE);
+      busywait_ms(2000);
+
+
+      usb_cli_hid_report(usb_hid_client_ctx, HID_RELEASE);        
+      busywait_ms(2000);
+
+
+      usb_cli_hid_report(usb_hid_client_ctx, HID_VOL_DEC);        
+      busywait_ms(2000);
+
+
+      usb_cli_hid_report(usb_hid_client_ctx, HID_RELEASE);        
+      busywait_ms(2000);  
+    }
+    else if (2 == usb_hid_auto_mode)
+    {
+      usb_cli_hid_report(usb_hid_client_ctx, usb_hid_cmd);        
+      busywait_ms(50);
+
+      usb_hid_auto_mode = 3;
+    }
+    else if (3 == usb_hid_auto_mode)
+    {
+      busywait_ms(10);
+    }
+    else if (4 == usb_hid_auto_mode)
+    {
+      usb_cli_hid_report(usb_hid_client_ctx, usb_hid_cmd);
+      usb_cli_hid_report(usb_hid_client_ctx, HID_RELEASE);        
+      busywait_ms(500);
+    }
+    else if (5 == usb_hid_auto_mode)
+    {
+      usb_cli_hid_report(usb_hid_client_ctx, HID_RELEASE);        
+      busywait_ms(500);
+    }
+    else if (6 == usb_hid_auto_mode)
+    {
+      usb_cli_hid_report(usb_hid_client_ctx, HID_PLAY_PAUSE);
+      busywait(USB_HID_DELAY);
+
+      usb_cli_hid_report(usb_hid_client_ctx, HID_RELEASE);        
+      busywait(USB_HID_DELAY);
+
+      usb_cli_hid_report(usb_hid_client_ctx, HID_VOL_INC);        
+      busywait(USB_HID_DELAY);
+
+      usb_cli_hid_report(usb_hid_client_ctx, HID_RELEASE);        
+      busywait(USB_HID_DELAY);   
+
+    }
+
+  }
+
+}
+
+
+boolean usb_hid_task_init(void)
+{
+  qurt_thread_attr_t attr;
+  int status; 
+
+  qurt_signal2_init(&(usb_hid_sigs));
+  usb_hid_ptr = &usb_hid_sigs;
+
+  qurt_thread_attr_init(&attr);
+  qurt_thread_attr_set_name(&attr, "usb_hid");
+  usb_hid_stack = malloc(USB_HID_THREAD_STACK_SIZE);
+  qurt_thread_attr_set_priority(&attr, 0x81); //low-priority thread
+  qurt_thread_attr_set_stack_size(&attr, USB_HID_THREAD_STACK_SIZE);
+  qurt_thread_attr_set_stack_addr (&attr, (unsigned long long *)usb_hid_stack);
+
+  status = qurt_thread_create(&(usb_hid_id), &attr, usb_hid_main, NULL);
+  if (status != QURT_EOK)
+  {
+    USB_ASSERT(0);
+  }
+  return TRUE;
+}
+#endif
+
+boolean usb_lb_task_init(void)
+{
+  qurt_thread_attr_t attr;
+  int status; 
+  qurt_signal2_init(&(usb_audio_lb_sigs));
+  usb_audio_lb_sigs_ptr = &usb_audio_lb_sigs;
+
+  qurt_thread_attr_init(&attr);
+  qurt_thread_attr_set_name(&attr, "usb_audio_lb");
+  usb_audio_lb_stack = malloc(USB_AUDIO_LB_THREAD_STACK_SIZE);
+  qurt_thread_attr_set_priority(&attr, 39); //low-priority thread
+  qurt_thread_attr_set_stack_size(&attr, USB_AUDIO_LB_THREAD_STACK_SIZE);
+  qurt_thread_attr_set_stack_addr (&attr, (unsigned long long *)usb_audio_lb_stack);
+
+  status = qurt_thread_create(&(usb_audio_lb_id), &attr, usb_audio_lb_main, NULL);
+  if (status != QURT_EOK)
+  {
+    USB_ASSERT(0);
+  }
+#ifdef USB_HID_TEST
+  usb_hid_task_init();
+#endif
+  return TRUE;
+}
+

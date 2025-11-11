@@ -1,0 +1,359 @@
+//============================================================================
+/**
+ * @file      usb_external_util.c
+ * @author    kameya
+ * @date      12-Dec-2017
+ *
+ * @brief     USB external dependency APIs.
+ *
+ * @details   The module provides wrapper for interrupt APIs.
+ * 
+ * @note
+ * 
+ * @ref
+ *
+ *            Copyright (c) 2017 Qualcomm Technologies, Incorporated.
+ *            All Rights Reserved.
+ *            Qualcomm Confidential and Proprietary
+ * 
+ */
+//============================================================================
+
+//----------------------------------------------------------------------------
+// Include Files
+//----------------------------------------------------------------------------
+#include "busywait.h"
+#include "pwr_mgr.h"
+#include "err.h"
+#include "acdb.h"
+#include "usb_svc_data.h"
+
+#include "usb_log.h"
+#include "usb_util.h"
+
+/*----------------------------------------------------------------------------
+ *  Function definitions
+ * -------------------------------------------------------------------------*/
+
+boolean usb_feature_halt_on_error = FALSE;
+
+//============================================================================
+/**
+* @function  - usb_delay_us
+*
+* @brief - Busywait delay in microseconds.
+*
+* @Note - None.
+*
+* @param - Delay in microseconds
+*
+* @return - None
+*
+*/
+//============================================================================
+void usb_delay_us(uint32 usecs)
+{
+  busywait(usecs);
+}
+
+//============================================================================
+/**
+* @function  - usb_delay_ms
+*
+* @brief - Busywait delay in mili-seconds.
+*
+* @Note - None.
+*
+* @param - Delay in mili-seconds.
+*
+* @return - None
+*
+*/
+//============================================================================
+void usb_delay_ms(uint32 msecs)
+{
+  int counter;
+  for (counter = 0; counter < msecs; counter++)
+  {
+    usb_delay_us(1000); // 1 ms
+  }
+}
+
+// ===========================================================================
+/**
+ * @function    usb_enable_clocks
+ * 
+ * @brief   This function will used to turn ON the USB clocks
+ * 
+ * @param   boolean* status_flag_ptr: pointer to dci_ctx->is_clk_on
+ *          boolean enable : If set would enable all clocks
+ * 
+ * @return  none
+ * 
+ */
+// ===========================================================================
+void usb_enable_clocks(boolean* status_flag_ptr, boolean enable)
+{
+  USB_LOG_1(log_usb_enable_clocks__enable_D, enable);
+  *status_flag_ptr = enable;
+  if(enable)
+  {
+    pm_vote(PM_RESOURCE_USB, TRUE);
+  }
+  else
+  {
+    pm_vote(PM_RESOURCE_USB, FALSE);
+  }
+}
+
+// ===========================================================================
+/**
+ * @function    usb_enable_clocks_in_isr
+ * 
+ * @brief   This function will turn ON the USB clocks in IRQ thread
+ * 
+ * @details  pm_vote function use mutext, so can only be trigger in non IRQ.
+ *           pm_wake_if_idle dont use mutex
+ * 
+ * @return  none
+ * 
+ */
+// ===========================================================================
+void usb_enable_clocks_in_isr(void)
+{
+  USB_LOG_DBG(log_usb_enable_clocks_in_isr);
+  pm_wake_if_idle(PM_RESOURCE_USB);
+}
+
+// ===========================================================================
+/**
+ * @function    usb_get_acdb_params
+ * 
+ * @brief   This function will read WHS_USB_DRV_PID block from ACDB
+ * 
+ * @details  This function will read WHS_USB_DRV_PID block from ACDB.
+ *           On failure to read parameters from ACDB IOCTL, all params are 
+ *           set to default value zero.
+ *
+ * @param   usb_drv_params_t - [IN] - Struct to copy USB driver params into.
+ * 
+ * @return  None
+ * 
+ */
+// ===========================================================================
+void usb_get_acdb_params(usb_drv_params_t* params)
+{
+  // Initialize ACDB
+  AcdbReturnCodesType acdb_ret = ACDB_SUCCESS;
+  struct _AcdbGblTblCmdType gbltbl_cmd;
+  AcdbQueryResponseType acdb_rsp;
+
+  // Query ACDB data
+  gbltbl_cmd.nModuleId = WHS_USB_SVC_MID;
+  gbltbl_cmd.nParamId = WHS_USB_DRV_PID;
+  gbltbl_cmd.nBufferPointer = (uint8_t *)params;
+  gbltbl_cmd.nBufferLength = sizeof(struct usb_drv_params);
+  acdb_ret = acdb_ioctl(ACDB_CMD_GET_GLBTBL_DATA,
+    (const uint8_t *)&gbltbl_cmd, sizeof(gbltbl_cmd), (uint8_t *)&acdb_rsp,
+    sizeof(acdb_rsp));
+
+  if (ACDB_SUCCESS != acdb_ret) {
+    memset(params, 0, sizeof(usb_drv_params_t));
+    // Enable L1 and L2 feature as default if ACDB is corrupt or not available..
+    params->feature_flags = WHS_USB_FEATURE_L1_MASK | WHS_USB_FEATURE_L2_MASK;
+  }
+}
+
+const char usb_assert_str[] = "usb_assert";
+void usb_error_fatal(void)
+{
+  err_Fatal_internal0((const err_const_type*)usb_assert_str);
+}
+
+void usb_set_halt_on_err(uint8 flags)
+{
+  usb_feature_halt_on_error = (flags & WHS_USB_FEATURE_HALT_ON_ERROR_MASK) ? TRUE : FALSE;
+}
+
+void usb_error_halt(uint32 log_enum)
+{
+  if(log_enum)
+  {
+    USB_LOG_ERR(log_enum);
+  }
+
+  if(usb_feature_halt_on_error)
+  {
+    usb_fn_util()->usb_error_fatal();
+  }
+}
+
+/*===========================================================================
+FUNCTION usb_os_spinlock_init
+
+DESCRIPTION
+The lock is used in HLOS to lock AL layer. 
+This to disable ISR to prevevnt recursive ISR trigger.
+
+DEPENDENCIES
+None.
+
+PARAMETER
+None
+
+RETURN VALUE
+None
+
+SIDE EFFECTS
+None.
+===========================================================================*/
+//TODO::USB remove global variable
+usblock_t usb_os_lock;
+boolean usb_os_lock_init = FALSE;
+void usb_os_spinlock_init(void)
+{
+  if(FALSE == usb_os_lock_init)
+  {
+    usblock_init(&usb_os_lock);
+    usb_os_lock_init = TRUE;
+  }
+}
+
+/*===========================================================================
+FUNCTION usb_os_spinlock_lock
+
+DESCRIPTION
+The lock is used in HLOS to lock AL layer. 
+This is to lock AL_LOCK and disable ISR to prevevnt recursive ISR trigger.
+
+DEPENDENCIES
+None.
+
+PARAMETER
+None
+
+RETURN VALUE
+None
+
+SIDE EFFECTS
+None.
+===========================================================================*/
+void usb_os_spinlock_lock(void)
+{
+  if(FALSE == usb_os_lock_init)
+  {
+    usblock_init(&usb_os_lock);
+  }
+  usblock_lock(&usb_os_lock);
+}
+
+/*===========================================================================
+FUNCTION usb_os_spinlock_unlock
+
+DESCRIPTION
+The lock is used in HLOS to lock AL layer. 
+This is to unlock AL_LOCK and enable ISR.
+
+DEPENDENCIES
+None.
+
+PARAMETER
+None
+
+RETURN VALUE
+None
+
+SIDE EFFECTS
+None.
+===========================================================================*/
+void usb_os_spinlock_unlock(void)
+{
+  usblock_unlock(&usb_os_lock);
+}
+
+/*===========================================================================
+FUNCTION HSU_OS_SAFE_ENTER_IMPL
+
+DESCRIPTION
+  Acquires the High-Speed USB stack Giant mutex.
+  This function may not be invoked from an interrupt context.
+
+DEPENDENCIES
+  None.
+
+RETURN VALUE
+  None.
+
+SIDE EFFECTS
+  Prevents execution of other High-Speed USB tasks until the mutex is 
+  released.
+
+===========================================================================*/
+void usb_os_safe_enter_d(void)
+{
+} /* hsu_os_safe_enter_impl */
+
+
+/*===========================================================================
+FUNCTION HSU_OS_SAFE_LEAVE_IMPL
+
+DESCRIPTION
+  Releases the High-Speed USB stack Giant mutex.
+  This function may not be invoked from an interrupt context.
+
+DEPENDENCIES
+  None.
+
+RETURN VALUE
+  None.
+
+SIDE EFFECTS
+  Enables execution of other High-Speed USB tasks.
+
+===========================================================================*/
+void usb_os_safe_leave_d(void)
+{
+} /* hsu_os_safe_leave_impl */
+
+void usb_mutex_init(qurt_mutex_t *lock)
+{
+  qurt_mutex_init(lock);
+}
+
+void usb_mutex_lock(qurt_mutex_t *lock)
+{
+  qurt_mutex_lock(lock);
+}
+
+void usb_mutex_unlock(qurt_mutex_t *lock)
+{
+  qurt_mutex_unlock(lock);
+}
+
+void usb_mutex_deinit(qurt_mutex_t *lock)
+{
+  qurt_mutex_destroy(lock);
+}
+
+//----------------------------------------------------------------------------
+// Function table definition of utility layer
+//----------------------------------------------------------------------------
+
+usb_fn_tbl_util_t fn_tbl_util = 
+{
+  usb_delay_us,
+  usb_delay_ms,
+  usb_enable_clocks,
+  usb_enable_clocks_in_isr,
+  usb_get_acdb_params,
+  usb_error_fatal,
+  usb_set_halt_on_err,
+  usb_error_halt,
+  usb_os_spinlock_init,
+  usb_os_spinlock_lock,
+  usb_os_spinlock_unlock,
+  usb_os_safe_enter_d,
+  usb_os_safe_leave_d
+};
+
+

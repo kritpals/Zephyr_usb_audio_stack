@@ -1,0 +1,249 @@
+/*==================================================================*/
+/**
+  @file usb_mem_util.c
+
+  USB memory utility implementation.
+
+  @file       usb_mem_util.c
+ 
+  @brief      Implements USB memory management APIs and wrappers.
+ 
+  @details    Implements USB memory management APIs and wrappers.
+ 
+               Copyright (c) 2017 Qualcomm Technologies Inc.
+               All Rights Reserved.
+               Qualcomm Confidential and Proprietary
+*/
+/*==================================================================*/
+
+/*------------------------------------------------------------------------------------------
+ * Include Files
+ * ----------------------------------------------------------------------------------------*/
+#include <stdio.h>
+#include <stdlib.h>
+#include "qurt.h"
+#include "memheap_lite.h"         //FOR memalign
+#include <xtensa/core-macros.h>  //cache line api
+#include "usb_log.h"
+#include "usb_util.h"
+ 
+/*------------------------------------------------------------------------------------------
+ * Preprocessor Definitions and Constants
+ * ----------------------------------------------------------------------------------------*/
+#define USB_HLOS_MEM_HANDLE_MAX     (128)
+#define USB_MEM_CACHE_ALIGN_BYTES   (32)
+#define USB_MEM_ATTR_CACHED         (0)
+#define USB_MEM_ATTR_UNCACHED       (1)
+
+#define UNCACHED(addr) ((void*)((((uint32_t)addr) & ~0xf0000000)))
+#define CACHED(addr) ((void*)((((uint32_t)addr) & ~0xf0000000) | 0x20000000))
+
+/*----------------------------------------------------------------------------
+ * Type Declarations
+ * -------------------------------------------------------------------------*/
+
+struct usb_mem_handle
+{
+  uint8* vaddr;
+  uint8  pad_offset;
+  uint8  seq_num;
+  uint16 size;
+};
+
+typedef union 
+{
+  uint64 value;
+  struct usb_mem_handle handle;
+}
+usb_mem_handle_t;
+
+typedef struct usb_mem_ctx
+{
+  uint16 alloc_index;
+  uint16 seq_num;           // sequence number counter
+  uint16 alloc_size;        // size of currently allocated memory by USB driver.
+  uint16 h_arr_size;        // size of the h_arr.
+  usb_mem_handle_t* h_arr;  // array of handles to memory 
+}
+usb_mem_ctx_t;
+
+static usb_mem_ctx_t usb_mem;
+
+/*----------------------------------------------------------------------------
+ *  Global variable definition
+ * -------------------------------------------------------------------------*/
+
+/*----------------------------------------------------------------------------
+ *  Function definitions
+ * -------------------------------------------------------------------------*/
+
+void usb_mem_barrier(void)
+{
+  __asm__ __volatile__("memw");
+}
+
+void* usb_mem_attr_uncached(void* ptr)
+{
+  return (void*)((uint32)ptr & ~0xf0000000);
+}
+
+void* usb_mem_attr_writethrough(void* ptr)
+{
+  return (void*)(((uint32)ptr & ~0xf0000000)| 0x40000000);
+}
+
+void* usb_mem_attr_uncached_inv(void* ptr, uint32 size)
+{
+  xthal_dcache_region_writeback_inv(ptr, size);
+  return usb_fn_mem_util()->usb_mem_attr_uncached(ptr);
+}
+
+void usb_mem_init(void)
+{
+  uint32 i;
+  usb_mem.alloc_index = 0;
+  usb_mem.alloc_size  = 0;
+  usb_mem.seq_num     = 0;
+  usb_mem.h_arr_size  = USB_HLOS_MEM_HANDLE_MAX;
+  usb_mem.h_arr       = (usb_mem_handle_t*) malloc(usb_mem.h_arr_size * sizeof(usb_mem_handle_t));
+
+  USB_ASSERT(usb_mem.h_arr);
+  for(i=0; i < usb_mem.h_arr_size; i++)
+  {
+    usb_mem.h_arr[i].value = 0;
+  }
+}
+
+void usb_mem_deinit(void)
+{
+  uint32 i;
+  usb_mem.alloc_index = 0;
+  usb_mem.alloc_size  = 0;
+  usb_mem.seq_num     = 0;
+  for(i=0; i < usb_mem.h_arr_size; i++)
+  {
+    if(usb_mem.h_arr[i].handle.vaddr)
+    {
+      free(CACHED(usb_mem.h_arr[i].handle.vaddr));
+    }
+    usb_mem.h_arr[i].value = 0;
+  }
+  usb_mem.h_arr_size  = 0;
+  free(usb_mem.h_arr);
+}
+
+void* usb_malloc_internal(uint32 size, uint8 mem_attr)
+{
+  uint32 num_try = 0;
+  uint8  mem_offset;
+  void*  mem_addr;
+  uint16 mem_size;
+
+  usb_fn_util()->usb_os_spinlock_lock();
+
+  while((NULL != usb_mem.h_arr[usb_mem.alloc_index].handle.vaddr) && (num_try < usb_mem.h_arr_size))
+  {
+    CIRINC(usb_mem.alloc_index, usb_mem.h_arr_size);
+    num_try++;
+  }
+
+  if (NULL != usb_mem.h_arr[usb_mem.alloc_index].handle.vaddr)
+  {
+    USB_LOG_ERR_1(log_usb_malloc_internal__fail_size_D, size);
+    usb_fn_util()->usb_os_spinlock_unlock();
+    USB_ASSERT(FALSE);
+    return NULL;
+  }
+
+  mem_offset = 0;
+  mem_size = (mem_attr == USB_MEM_ATTR_UNCACHED) ? size + USB_MEM_CACHE_ALIGN_BYTES : size;
+  mem_addr = (uint8*) malloc(mem_size);
+  USB_ASSERT(mem_addr);
+  memset(mem_addr, 0, mem_size);
+
+  if(mem_attr == USB_MEM_ATTR_UNCACHED)
+  {
+    mem_offset = USB_MEM_CACHE_ALIGN_BYTES - (((uint32) mem_addr) % USB_MEM_CACHE_ALIGN_BYTES);
+    xthal_dcache_region_writeback_inv(mem_addr, mem_size);
+    mem_addr = UNCACHED(mem_addr);
+  }
+
+  usb_mem.h_arr[usb_mem.alloc_index].handle.vaddr      = mem_addr;
+  usb_mem.h_arr[usb_mem.alloc_index].handle.pad_offset = mem_offset;
+  usb_mem.h_arr[usb_mem.alloc_index].handle.seq_num    = usb_mem.seq_num++;
+  usb_mem.h_arr[usb_mem.alloc_index].handle.size       = mem_size;
+  usb_mem.alloc_size += mem_size;
+
+  USB_ULOG_3(SNPS_QLOG, "addr 0x%X, idx %u, size %u", (uint32) mem_addr, usb_mem.alloc_index, (uint32) size);
+  CIRINC(usb_mem.alloc_index, usb_mem.h_arr_size);
+
+  usb_fn_util()->usb_os_spinlock_unlock();
+  return (mem_addr + mem_offset);
+}
+
+void* usb_malloc(uint32 size)
+{
+  return usb_malloc_internal(size, USB_MEM_ATTR_CACHED);
+}
+
+void* usb_malloc_uncached(uint32 size)
+{
+  return usb_malloc_internal(size, USB_MEM_ATTR_UNCACHED);
+}
+
+void usb_free(void** addr)
+{
+  uint32 i;
+  usb_fn_util()->usb_os_spinlock_lock();
+
+  if((NULL == addr) || (NULL == *addr))
+  {
+    USB_ASSERT(FALSE);
+    return;
+  }
+
+  for(i=0; i < usb_mem.h_arr_size; i++)
+  {
+    if((*addr) == (usb_mem.h_arr[i].handle.vaddr + usb_mem.h_arr[i].handle.pad_offset))
+    {
+      free(CACHED(usb_mem.h_arr[i].handle.vaddr));
+      usb_mem.alloc_size -= usb_mem.h_arr[i].handle.size;
+      (*addr) = NULL;
+      usb_mem.h_arr[i].value = 0;
+      usb_fn_util()->usb_os_spinlock_unlock();
+      return;
+    }
+  }
+
+  USB_LOG_ERR_1(log_usb_free__fail_addr_D, (uint32)(*addr));  
+  USB_ASSERT(FALSE);
+  usb_fn_util()->usb_os_spinlock_unlock();
+}
+
+uint32 usb_print_meminfo(void)
+{
+  usb_fn_util()->usb_os_spinlock_lock();
+  USB_LOG_ERR_1(log_usb_print_meminfo__size_D, usb_mem.alloc_size);  
+  usb_fn_util()->usb_os_spinlock_unlock();
+  return usb_mem.alloc_size;
+}
+
+
+//----------------------------------------------------------------------------
+// Function table definition for memory utility layer
+//----------------------------------------------------------------------------
+
+usb_fn_tbl_mem_util_t fn_tbl_mem_util = 
+{
+  usb_mem_barrier,
+  usb_mem_attr_uncached,
+  usb_mem_attr_writethrough,
+  usb_mem_attr_uncached_inv,
+  usb_mem_init,
+  usb_mem_deinit,
+  usb_malloc,
+  usb_malloc_uncached,
+  usb_free,
+  usb_print_meminfo,
+};
+

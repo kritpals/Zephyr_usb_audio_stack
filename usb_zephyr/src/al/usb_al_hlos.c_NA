@@ -1,0 +1,1906 @@
+/*=======================================================================*//**
+ * @file        usb_hlos_al_bulk.c
+ * @author:     dpatnaik
+ * @date        12-Feb-2011
+ *
+ * @brief       USB (Qualcomm High-Speed USB) AL (Adaptation-Layer) implementation.
+ *
+ * @details     This file contains the implementation of the APIs to be used by
+ *              the boot Sahara downloader.
+ *
+ * @note        
+ *
+ *              Copyright 2011 QUALCOMM Incorporated.
+ *              All Rights Reserved.
+ *              Qualcomm Confidential and Proprietary
+ * 
+*//*========================================================================*/
+
+
+// ===========================================================================
+// 
+//                            EDIT HISTORY FOR FILE
+//   This section contains comments describing changes made to the module.
+//   Notice that changes are listed in reverse chronological order.
+// 
+// $Header: //components/rel/audio.whs/1.0/mcu_proc/core/wiredconnectivity/usb/src/al/usb_al_hlos.c#3 $ 
+// $DateTime: 2018/07/17 15:45:47 $ $Author: pwbldsvc $
+// 
+// when         who        what, where, why
+// --------   ---        ----------------------------------------------------------
+// 03/28/11   niting     Added callback support
+// 02/12/11   dpatnaik Initial revision
+//
+// ===========================================================================
+
+//----------------------------------------------------------------------------
+// Include Files
+//----------------------------------------------------------------------------
+//std lib
+#include <stdio.h>
+#include <stdlib.h>
+#include "comdef.h"           // common defines - basic types as uint32 etc
+#include <stringl/stringl.h>  // For memscpy
+#include "qurt_signal2.h"
+#include "qurt_thread.h"
+#include "qurt_error.h"
+#include "qurt.h"
+
+#include "usb_log.h"
+#include "usb_util.h"
+#include "usb_mem_util.h"
+
+#include "usb_al_hlos.h"
+#include "usb_api.h"
+#include "usb_audio.h"
+#include "usb_log_api.h"
+#include "usb_fd.h"
+#include "usb_dcd_ch9.h"
+
+//quick fix for interrupt init
+#include "usb_isr.h"
+#include "usb_svc_data.h"
+
+
+//----------------------------------------------------------------------------
+// Preprocessor Definitions and Constants
+// -------------------------------------------------------------------------*/
+
+#define USB_PRODUCT_ID      (USB_PID_UAC2_HEADSET)
+
+#define USB_DISABLE_HID     (1 << 0)
+#define USB_DISABLE_DFU     (1 << 1)
+#define USB_DISABLE_BULK    (1 << 2)
+
+//----------------------------------------------------------------------------
+// Type Declarations
+//----------------------------------------------------------------------------
+
+typedef struct
+{
+  boolean is_enumerated;
+  boolean vbus_high;
+  boolean is_suspend;
+  void (*notify) (uint32 event, uint32 client_id, void* data);
+  usb_audio_dev_config_t dev_cfg;
+  ctrl_client_ctx_t* ctrl_ctx;
+  client_ctx_t* client_ctx[USB_COMP_SIZE_MAX];
+  usb_fd_ctx_t* fd_ctx;
+  usb_isr_ctx_t isr_ctx;
+  usb_log_type* log_ptr;
+} usb0_ctx_t;
+
+usb0_ctx_t* usb0_ctx;
+
+#define USB_HLOS_THREAD_STACK_SIZE (1024)
+
+qurt_thread_t usb_hlos_id;
+qurt_signal2_t* usb_sigs_ptr;   // create pointer for usb have individual thread vs usb share thread
+qurt_signal2_t usb_hlos_sigs;
+uint8_t* usb_thread_stack;
+
+typedef struct usb_fn_tbl_al
+{
+  uint8* (*usb_get_str_dsc_from_acdb_str)(uint8 len, uint16* acdb_str);
+  void (*usb_set_comp_profile)(usb_audio_dev_config_t* dev_cfg, uint32 pid, uint8 op_mode, uint8 disable_flags);
+  void (*usb_set_audio_rev)(usb_audio_dev_config_t* dev_cfg, uint32 pid);
+  void (*usb_set_audio_profile)(usb_audio_dev_config_t* dev_cfg, usb_audio_profile_t audio_profile);
+  void* (*usb_client_get_config)(uint8 client_id);
+  void (*usb_client_notification)(uint32 event, uint32 client_id, void* data);
+  boolean (*usb_ctrl_out_cb)(uint8* setup_ptr, uint8* payload, uint32 payload_size);
+  boolean (*usb_ctrl_in_cb)(uint8* setup_ptr, uint8* payload, uint32* payload_size);
+  void (*usb_register_ctrl_client)(ctrl_client_ctx_t* ctrl_ctx);
+  void (*usb_al_hlos_isr_vbus_event)(uint32 vbus_high);
+  void (*usb_al_hlos_isr_pwr_event)(uint32 event_id);
+  void (*usb_al_hlos_log_timer_cb)(uint32 event_id);
+  void (*usb_al_hlos_enum_complete)(boolean enum_flag);
+  void (*usb_al_hlos_disconnect_handler)(void);
+  void (*usb_al_disconnect_cb)(void);
+  void (*usb_al_notify_suspend)(boolean is_suspend);
+  void (*usb_ctx_init)(void);
+  void (*usb_ctx_free)(void);
+  void (*usb_tx_complete)(usb_urb_t* urb);
+  void (*usb_rx_complete)(usb_urb_t* urb);
+  void (*usb_handle_reset)(void);
+  void (*usb_al_hlos_bulk_init)(usb_max_speed_required_t speed_required);
+  uint32 (*usb_client_cnt)(void);
+  void (*usb_deregister_client)(client_ctx_t* client_ctx);
+  boolean (*usb_register_client)(client_ctx_t* client_ctx);
+  void* (*usb_copy_client_data)(void* data_in, uint32 size);
+  uint32 (*usb_send_tx)(unsigned char *pkt, uint32 len, uint32 req_id, uint32 client_id, void* cb_data);
+  uint32 (*usb_send_hid_report)(uint32 client_id, usb_hid_bitmask_cmd_t report_mask);
+  uint32 (*usb_send_rx)(unsigned char *pkt, uint32 len, uint32 req_id, uint32 client_id, void* cb_data);
+  boolean (*usb_check_enum)(void);
+  uint32 (*usb_get_max_packet_size)(void);
+  void (*usb_remove_thread)(void);
+  client_ctx_t* (*usb_alloc_register_client_ctx)(usb_ifc_id ifc_id, usb_event_func_t event_cb, usb_func_cb_t rx_cb, usb_func_cb_t tx_cb, void* data, uint32 data_size);
+  void (*usb_shutdown)(void);
+  void (*usb_return_buffer)(client_ctx_t* client_ctx);
+  boolean (*usb_internal_close)(client_ctx_t* client_ctx);
+  void (*usb_thread_main)(void* data);
+  boolean (*usb_create_thread)(void);
+  void (*usb_log_read_send_ulog)(void);
+} usb_fn_tbl_al_t;
+
+extern usb_fn_tbl_al_t fn_tbl_al;
+#define usb_fn_al() (&fn_tbl_al)
+
+//----------------------------------------------------------------------------
+// Static Function Declarations and Definitions
+//----------------------------------------------------------------------------
+
+uint8* usb_get_str_dsc_from_acdb_str(uint8 len, uint16* acdb_str)
+{
+  uint8 str_len;
+  uint8 str_size_in_bytes;
+  uint8* str_ptr = NULL;
+  str_len = MIN(len, USB_STR_LEN_MAX);
+
+  if(str_len)
+  {
+    str_size_in_bytes = 2 + (str_len * sizeof(uint16));
+    USB_ASSERT(str_ptr = (uint8*)usb_fn_mem_util()->usb_malloc(str_size_in_bytes));
+    str_ptr[0] = str_size_in_bytes;
+    str_ptr[1] = USB_DESCTYPE_STRING;
+    memscpy(&str_ptr[2], (str_size_in_bytes - 2), acdb_str, str_len * sizeof(uint16));
+  }
+  return str_ptr;
+}
+
+static void usb_set_comp_profile(usb_audio_dev_config_t* dev_cfg, uint32 pid, uint8 op_mode, 
+  uint8 disable_flags)
+{
+  uint8 idx = 0;
+
+  if(op_mode == USB_OP_MODE_DFU) 
+  {
+    dev_cfg->usb_comp[idx++] = USB_IFC_ID_DFU;
+    dev_cfg->usb_comp_num_ifc = idx;
+    return;
+  }
+
+  switch(pid)
+  {
+    case USB_PID_UAC1_HEADSET:
+    case USB_PID_UAC2_HEADSET:
+    case USB_PID_UAC1_BADD3_HEADSET:
+    case USB_PID_UAC2_BADD3_HEADSET:
+    case USB_PID_UAC1_BADD3_UAC3_HEADSET:
+    case USB_PID_UAC2_BADD3_UAC3_HEADSET:
+    {
+
+      dev_cfg->usb_comp[idx++] = USB_IFC_ID_AUDIO_CONTROL;
+      dev_cfg->usb_comp[idx++] = USB_IFC_ID_AUDIO_STREAMING_SPEAKER;
+      dev_cfg->audio_profile   = USB_AUDIO_HEADSET;
+      dev_cfg->usb_comp[idx++] = USB_IFC_ID_AUDIO_STREAMING_MIC;
+    }
+    break;
+
+    case USB_PID_UAC1_HEADPHONE:
+    case USB_PID_UAC2_HEADPHONE:
+    case USB_PID_UAC1_BADD3_HEADPHONE:
+    case USB_PID_UAC2_BADD3_HEADPHONE:
+    case USB_PID_UAC1_BADD3_UAC3_HEADPHONE:
+    case USB_PID_UAC2_BADD3_UAC3_HEADPHONE:
+    {
+      dev_cfg->audio_profile = USB_AUDIO_HEADPHONE;
+      dev_cfg->usb_comp[idx++] = USB_IFC_ID_AUDIO_CONTROL;
+      dev_cfg->usb_comp[idx++] = USB_IFC_ID_AUDIO_STREAMING_SPEAKER;
+    }
+    break;
+
+    case USB_PID_UAC1_MICROPHONE:             // 0x9610,
+    case USB_PID_UAC2_MICROPHONE:             // 0x9611,
+    case USB_PID_UAC1_BADD3_MICROPHONE:       // 0x9612,
+    case USB_PID_UAC2_BADD3_MICROPHONE:       // 0x9613,
+    case USB_PID_UAC1_BADD3_UAC3_MICROPHONE:  // 0x9614,
+    case USB_PID_UAC2_BADD3_UAC3_MICROPHONE:  // 0x9615,
+    {
+      dev_cfg->audio_profile   = USB_AUDIO_MICROPHONE;
+      dev_cfg->usb_comp[idx++] = USB_IFC_ID_AUDIO_CONTROL;
+      dev_cfg->usb_comp[idx++] = USB_IFC_ID_AUDIO_STREAMING_MIC;
+    }
+    break;
+
+    default:
+      dev_cfg->audio_profile = USB_AUDIO_HEADSET;
+      dev_cfg->usb_comp[idx++] = USB_IFC_ID_AUDIO_CONTROL;
+      dev_cfg->usb_comp[idx++] = USB_IFC_ID_AUDIO_STREAMING_SPEAKER;
+      dev_cfg->usb_comp[idx++] = USB_IFC_ID_AUDIO_STREAMING_MIC;
+  }
+
+  if(FALSE == (disable_flags & USB_DISABLE_HID))
+  {
+    dev_cfg->usb_comp[idx++] = USB_IFC_ID_HID;
+  }
+
+  if(FALSE == (disable_flags & USB_DISABLE_DFU))
+  {
+    dev_cfg->usb_comp[idx++] = USB_IFC_ID_DFU;
+  }
+
+  if(FALSE == (disable_flags & USB_DISABLE_BULK))
+  {
+    dev_cfg->usb_comp[idx++] = USB_IFC_ID_BULK;
+  }
+
+  USB_ASSERT(idx < USB_COMP_SIZE_MAX);
+  dev_cfg->usb_comp_num_ifc = idx;
+}
+
+static void usb_set_audio_rev(usb_audio_dev_config_t* dev_cfg, uint32 pid)
+{
+  USB_ASSERT(dev_cfg);
+
+  dev_cfg->audio_rev_arr_size = 0;
+  
+  switch(pid)
+  {
+    case USB_PID_UAC1_BADD3_UAC3_HEADSET:     // 0x9608
+    case USB_PID_UAC1_BADD3_UAC3_HEADPHONE:   // 0x960E
+    case USB_PID_UAC1_BADD3_UAC3_MICROPHONE:  // 0x9614
+    {
+      dev_cfg->audio_rev_arr[2] = USB_AUDIO_CLASS_REV_3;
+      dev_cfg->audio_rev_arr_size++;
+    }
+    case USB_PID_UAC1_BADD3_HEADSET:          // 0x9606
+    case USB_PID_UAC1_BADD3_HEADPHONE:        // 0x960C
+    case USB_PID_UAC1_BADD3_MICROPHONE:       // 0x9612
+    {
+      dev_cfg->audio_rev_arr[1] = USB_AUDIO_CLASS_BADD3;
+      dev_cfg->audio_rev_arr_size++;
+    }
+    case USB_PID_UAC1_HEADSET:                // 0x9604
+    case USB_PID_UAC1_HEADPHONE:              // 0x960A
+    case USB_PID_UAC1_MICROPHONE:             // 0x9610
+    {
+      dev_cfg->audio_rev_arr[0] = USB_AUDIO_CLASS_REV_1;
+      dev_cfg->audio_rev_arr_size++;
+    }
+    break;
+
+    case USB_PID_UAC2_BADD3_UAC3_HEADPHONE:   // 0x960F
+    case USB_PID_UAC2_BADD3_UAC3_HEADSET:     // 0x9609
+    case USB_PID_UAC2_BADD3_UAC3_MICROPHONE:  // 0x9615
+    {
+      dev_cfg->audio_rev_arr[2] = USB_AUDIO_CLASS_REV_3;
+      dev_cfg->audio_rev_arr_size++;
+    }
+    case USB_PID_UAC2_BADD3_HEADSET:          // 0x9607
+    case USB_PID_UAC2_BADD3_HEADPHONE:        // 0x960D
+    case USB_PID_UAC2_BADD3_MICROPHONE:       // 0x9613
+    {
+      dev_cfg->audio_rev_arr[1] = USB_AUDIO_CLASS_BADD3;
+      dev_cfg->audio_rev_arr_size++;
+    }
+    case USB_PID_UAC2_HEADSET:                // 0x9605
+    case USB_PID_UAC2_HEADPHONE:              // 0x960B
+    case USB_PID_UAC2_MICROPHONE:             // 0x9611
+    default:
+    {
+      dev_cfg->audio_rev_arr[0] = USB_AUDIO_CLASS_REV_2;
+      dev_cfg->audio_rev_arr_size++;
+    }
+    break;
+  }
+}
+
+void usb_set_audio_profile(usb_audio_dev_config_t* dev_cfg, usb_audio_profile_t audio_profile)
+{
+  switch(dev_cfg->audio_profile)
+  {
+    case USB_AUDIO_HEADSET:
+    {
+      if(audio_profile == USB_AUDIO_HEADSET_ADAPTOR || (audio_profile == USB_AUDIO_SPEAKERPHONE)) 
+      {
+        dev_cfg->audio_profile = audio_profile;
+      }
+    }
+    break;
+
+    case USB_AUDIO_HEADPHONE:
+    {
+      if(audio_profile == USB_AUDIO_SPEAKER) 
+      {
+        dev_cfg->audio_profile = audio_profile;
+      }
+    }
+    break;
+
+    case USB_AUDIO_MICROPHONE:
+    default:
+    {
+      // Do nothing
+    }
+  }
+}
+
+boolean usb_set_params(usb_dev_params_t* svc_params, usb_ifc_id** usb_comp, uint8* usb_comp_num_ifc)
+{
+  USB_OS_SAFE_ENTER();
+
+  USB_ASSERT(usb0_ctx && svc_params && usb_comp && usb_comp_num_ifc);
+
+  usb_fn_al()->usb_set_comp_profile(&usb0_ctx->dev_cfg, svc_params->qc_pid, svc_params->op_mode, svc_params->disable_flags);
+  usb_fn_al()->usb_set_audio_profile(&usb0_ctx->dev_cfg, (usb_audio_profile_t) svc_params->audio_profile);
+  usb_fn_al()->usb_set_audio_rev(&usb0_ctx->dev_cfg, svc_params->qc_pid);
+
+  usb0_ctx->dev_cfg.op_mode     = svc_params->op_mode;
+  usb0_ctx->dev_cfg.mic_type    = svc_params->mic_type;
+  usb0_ctx->dev_cfg.top_aud_rev = svc_params->top_aud_rev;
+  usb0_ctx->dev_cfg.vendor_id   = (svc_params->vid_override) ? svc_params->vid_override : USB_VENDOR_ID_QUALCOMM; 
+  usb0_ctx->dev_cfg.product_id  = (svc_params->pid_override) ? svc_params->pid_override : svc_params->qc_pid;
+
+  *usb_comp = &usb0_ctx->dev_cfg.usb_comp[0];
+  *usb_comp_num_ifc = usb0_ctx->dev_cfg.usb_comp_num_ifc;
+
+  USB_OS_SAFE_LEAVE();
+
+  return TRUE;
+}
+
+void* usb_client_get_config(uint8 client_id)
+{
+  return usb0_ctx->client_ctx[client_id]->data;
+}
+
+void usb_client_notification(uint32 event, uint32 client_id, void* data)
+{
+  if(NULL == usb0_ctx->client_ctx[client_id])
+  {
+    USB_LOG_ERR_1(log_usb_client_notification__empty_client_id_D, client_id);
+    return;
+  }
+
+  USB_ULOG_2(BAM_QLOG, "event %d, data 0x%x", event, (uint32)data);
+
+  switch(event)
+  {
+    case USB_EVENT_DFU_ENTRY:
+    case USB_EVENT_DFU_EXIT:
+    case USB_EVENT_AUDIO_CTRL_CFG:
+    case USB_EVENT_STREAM_ENABLE:
+    {
+      usb0_ctx->client_ctx[client_id]->app_event_cb_func(event, data);
+    }
+    break;
+
+    case USB_EVENT_STREAM_DISABLE:
+    {
+      usb_fn_fd()->usb_fd_cancel_transfer(usb0_ctx->fd_ctx, client_id);
+      usb0_ctx->client_ctx[client_id]->app_event_cb_func(event, data);
+    }
+    break;
+
+    case USB_EVENT_ENABLED:
+    case USB_EVENT_DISCONNECT:
+    case USB_EVENT_CLOSE_COMPLETE:
+    case USB_EVENT_TYPE_MAX:
+    default:
+      USB_ULOG(BAM_QLOG, "unknown client layer event");
+  }
+}
+
+boolean usb_ctrl_out_cb(uint8* setup_ptr, uint8* payload, uint32 payload_size)
+{
+  USB_ASSERT(usb0_ctx->ctrl_ctx);
+  return usb0_ctx->ctrl_ctx->ctrl_out_cb((usb_setup_t*)setup_ptr, payload, payload_size);
+}
+
+boolean usb_ctrl_in_cb(uint8* setup_ptr, uint8* payload, uint32* payload_size)
+{
+  USB_ASSERT(usb0_ctx->ctrl_ctx);
+  return usb0_ctx->ctrl_ctx->ctrl_in_cb((usb_setup_t*)setup_ptr, payload, payload_size);
+}
+
+void usb_register_ctrl_client(ctrl_client_ctx_t* ctrl_ctx)
+{
+  usb0_ctx->ctrl_ctx = ctrl_ctx;
+}
+
+// ===========================================================================
+/**
+ * @function    usb_al_hlos_isr_vbus_event
+ * 
+ * @brief   This function trigger when interrupt PWR happen.
+ *
+ * @details This function trigger when interrupt PWR happen. Do not wait in isr 
+ *          set vbus status and trigger thread to handle
+ * 
+ * @param   event_id   -  [IN] The isr value when isr_pwr trigger
+ *
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+void usb_al_hlos_isr_vbus_event(uint32 vbus_high)
+{
+  USB_ASSERT(usb0_ctx);
+  
+  USB_ULOG_1(BAM_QLOG, "power_event %u", (uint32) vbus_high);
+  usb0_ctx->vbus_high = vbus_high;
+  qurt_signal2_set(usb_sigs_ptr, USB0_TASK_VBUS_EVENT_SIG);
+}
+
+// ===========================================================================
+/**
+ * @function    usb_al_hlos_isr_pwr_event
+ * 
+ * @brief   This function trigger when interrupt PWR happen.
+ *
+ * @details This function trigger when interrupt PWR happen. Do not wait in isr 
+ *          set vbus status and trigger thread to handle
+ * 
+ * @param   event_id   -  [IN] The isr value when isr_pwr trigger
+ *
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+void usb_al_hlos_isr_pwr_event(uint32 event_id)
+{
+  USB_ASSERT(usb0_ctx);
+  
+  USB_ULOG_1(BAM_QLOG, "power_event %u", (uint32) event_id);
+
+  qurt_signal2_set(usb_sigs_ptr, USB0_TASK_PWR_EVENT_QUEUE_SIG);
+}
+
+// ===========================================================================
+/**
+ * @function    usb_al_log_timer_event
+ * 
+ * @brief   This signals USB task when log timer expires.
+ *
+ * @details This function  USB task when log timer expires.
+ * 
+ * @param   None   -  [IN] The isr value when isr_pwr trigger
+ *
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+void usb_al_hlos_log_timer_cb(uint32 event_id)
+{
+  USB_ASSERT(usb0_ctx);
+  qurt_signal2_set(usb_sigs_ptr, USB0_TASK_LOG_TIMER_EXP_SIG);
+}
+
+// ===========================================================================
+/**
+ * @function    usb_al_hlos_enum_complete
+ * 
+ * @brief   This function is registered to be called when enumeration is
+ *          complete.
+ *
+ * @details This function will set a static variable to indicate enumeration has
+ *          completed.
+ * 
+ * @param   None.
+ * 
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+static void usb_al_hlos_enum_complete(boolean enum_flag)
+{
+  USB_ASSERT(usb0_ctx);
+  USB_LOG_1(log_usb_al_hlos_enum_complete__enum_flag_D, enum_flag);
+  usb0_ctx->is_enumerated = enum_flag;
+  qurt_signal2_set(usb_sigs_ptr, USB0_TASK_ENUM_DONE_SIG);
+}
+
+// ===========================================================================
+/**
+ * @function    usb_al_hlos_disconnect_handler
+ * 
+ * @brief   This function will be called when vbus change
+ *
+ * @details This function will when vbus change. if usb is enum, then return
+ *          all buffer back to client and shutdown usb.
+ * 
+ * @param   None.
+ * 
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+void usb_al_hlos_disconnect_handler(void)
+{
+  uint32 idx;
+  USB_ASSERT(usb0_ctx);
+
+  USB_LOG(log_usb_al_hlos_disconnect_handler);
+  USB_ULOG(BAM_QLOG, "disconnect_handle_happen");
+
+  if(usb0_ctx->is_enumerated == TRUE)
+  {
+    for (idx=0; idx < usb0_ctx->dev_cfg.usb_comp_num_ifc; idx++)
+    {
+      if ((NULL != usb0_ctx->client_ctx[idx]))
+      {
+        usb_fn_al()->usb_return_buffer(usb0_ctx->client_ctx[idx]);
+      }
+    }
+  }
+
+  usb_fn_al()->usb_shutdown();
+  return; 
+}
+
+
+// ===========================================================================
+/**
+ * @function    usb_al_disconnect_cb
+ * 
+ * @brief   This function is call when disconnect events happend.
+ *
+ * @details In threading mode, we check vbus, and handle disconnect. So no need for
+ *          disconnect callback
+ * 
+ * @param   None
+ * 
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+void usb_al_disconnect_cb(void)
+{
+  USB_ULOG(DBG_E_QLOG, "disconnect_handle_happen on wrong path");
+  USB_LOG(log_usb_al_disconnect_cb);
+}
+
+void usb_al_notify_suspend(boolean is_suspend)
+{
+  USB_ULOG(DBG_E_QLOG, "disconnect_handle_happen on wrong path");
+  USB_LOG_1(log_usb_al_notify_suspend__susflag_D, is_suspend);
+  //usb0_ctx->is_suspend = is_suspend;
+}
+
+// ===========================================================================
+/**
+ * @function    usb_ctx_init
+ * 
+ * @brief   This function allocate memory for usb_ctx, when usb thread is create
+ *
+ * @details This function will allocate usb ctx and reset all value.
+ * 
+ * @param   None.
+ * 
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+
+void usb_ctx_init(void)
+{
+  usb_drv_params_t* usb_params;
+
+  if (NULL != usb0_ctx)
+  {
+    return;
+  }
+
+  USB_ASSERT(usb0_ctx = (usb0_ctx_t*) usb_fn_mem_util()->usb_malloc(sizeof(usb0_ctx_t)));
+  usb0_ctx->is_enumerated         = FALSE;
+  usb0_ctx->vbus_high             = TRUE;
+  usb0_ctx->fd_ctx                = NULL;  
+  usb0_ctx->isr_ctx.usb_sigs_ptr  = usb_sigs_ptr;
+  usb0_ctx->isr_ctx.pwr_handle    = usb_fn_al()->usb_al_hlos_isr_pwr_event;  
+  usb0_ctx->isr_ctx.vbus_handle   = usb_fn_al()->usb_al_hlos_isr_vbus_event;
+  usb0_ctx->notify                = usb_fn_al()->usb_client_notification;
+  usb0_ctx->log_ptr               = NULL;
+
+  USB_ASSERT(usb_params = (usb_drv_params_t*)usb_fn_mem_util()->usb_malloc(sizeof(usb_drv_params_t)));
+
+  usb_fn_util()->usb_get_acdb_params(usb_params);
+
+  usb0_ctx->dev_cfg.product_str = usb_fn_al()->usb_get_str_dsc_from_acdb_str(usb_params->product_str_len, usb_params->product_str);
+  usb0_ctx->dev_cfg.manuf_str   = usb_fn_al()->usb_get_str_dsc_from_acdb_str(usb_params->manuf_str_len, usb_params->manuf_str);
+  usb0_ctx->dev_cfg.feature_flags = usb_params->feature_flags;
+
+  usb_fn_util()->usb_set_halt_on_err(usb_params->feature_flags);
+
+  if(usb_params->lang_id && usb0_ctx->dev_cfg.product_str && usb0_ctx->dev_cfg.manuf_str)
+  {
+    usb0_ctx->dev_cfg.lang_id = usb_params->lang_id;
+  }
+
+  usb_fn_mem_util()->usb_free((void**)&usb_params);
+}
+
+// ===========================================================================
+/**
+ * @function    usb_ctx_free
+ * 
+ * @brief   This function free memory for usb_ctx, when usb is thread destroy
+ *
+ * @details This function will free usb_ctx and reset all value.
+ * 
+ * @param   None.
+ * 
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+void usb_ctx_free(void)
+{
+  usb0_ctx->is_enumerated = FALSE;
+  usb0_ctx->vbus_high = FALSE;
+
+  if(usb0_ctx->dev_cfg.product_str)
+  {
+    usb_fn_mem_util()->usb_free((void**)&usb0_ctx->dev_cfg.product_str);
+  }
+
+  if (usb0_ctx->dev_cfg.manuf_str)
+  {
+    usb_fn_mem_util()->usb_free((void**)&usb0_ctx->dev_cfg.manuf_str);
+  }
+
+  usb_fn_mem_util()->usb_free((void**)&usb0_ctx);
+}
+
+// ===========================================================================
+/**
+ * @function    usb_tx_complete
+ * 
+ * @brief   This function will be a called after each URB transmit is complete.
+ *
+ * @details This function will be a called after each URB transmit is complete.
+ * 
+ * @param   *urb   -  [IN/OUT] URB corresponding to the current transmission
+ * 
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+void usb_tx_complete (usb_urb_t* urb)
+{
+  usb_mips_start(usb_mips__tx_complete);
+
+  USB_ASSERT(urb && (urb->client_id < usb0_ctx->dev_cfg.usb_comp_num_ifc));
+
+  if (NULL ==usb0_ctx->client_ctx[urb->client_id])
+  {
+    USB_LOG_ERR_1(log_usb_tx_complete__kill_cli_D, urb->client_id);
+    return;
+  }
+
+  if (urb->transfer_status != USB_URB_STATUS_COMPLETE_OK)
+  {
+    USB_LOG_ERR_3(log_usb_tx_complete__fail_cli_D_trans_stats_D_len_D,
+      urb->client_id, urb->transfer_status, urb->actual_length);
+  }
+  else
+  {
+    if (urb->actual_length != urb->transfer_length)
+    {
+      USB_LOG_ERR_3(log_usb_tx_complete__len_err_cli_D_tran_len_D_act_len_D, 
+        urb->client_id, urb->transfer_length, urb->actual_length);
+      urb->transfer_status = USB_URB_STATUS_COMPLETE_ERROR;
+    }
+  }
+
+  usb_mips_stop(usb_mips__tx_complete);
+  usb_mips_start(usb_mips__tx_cb);
+
+  if (usb0_ctx->client_ctx[urb->client_id]->app_tx_cb_func)
+  {
+    usb0_ctx->client_ctx[urb->client_id]->app_tx_cb_func(urb->transfer_buffer_ptr, urb->actual_length, 
+      urb->transfer_status, urb->cb_data);
+  }
+}
+
+// ===========================================================================
+/**
+ * @function    usb_rx_complete
+ * 
+ * @brief   This function will be a called after each URB receive is complete.
+ *
+ * @details This function will be a called after each URB receive is complete.
+ * 
+ * @param   *urb   -  [IN/OUT] URB corresponding to the current reception
+ * 
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+void usb_rx_complete (usb_urb_t* urb)
+{
+  usb_mips_start(usb_mips__rx_complete);
+
+  USB_ASSERT(urb && (urb->client_id < USB_COMP_SIZE_MAX) && usb0_ctx->client_ctx[urb->client_id]);
+
+  if(USB_URB_STATUS_TRANSFER_CANCEL == urb->transfer_status)
+  {
+    USB_LOG_DBG_2(log_usb_rx_complete__cancel_cli_D_len_D, 
+        urb->client_id, urb->actual_length);
+  }
+  else if (urb->transfer_status != USB_URB_STATUS_COMPLETE_OK)
+  {
+    USB_LOG_ERR_3(log_usb_rx_complete__fail_cli_D_trans_stats_D_len_D,
+      urb->client_id, urb->transfer_status, urb->actual_length);
+  }
+  else
+  {
+    if (urb->actual_length == 0)
+    {
+      urb->transfer_status = USB_URB_STATUS_COMPLETE_ERROR;
+      USB_LOG_ERR_1(log_usb_rx_complete__ZLP_cli_D, urb->client_id);
+    }
+  }
+
+  usb_mips_stop(usb_mips__rx_complete);
+  usb_mips_start(usb_mips__rx_cb);
+
+  if (usb0_ctx->client_ctx[urb->client_id]->app_rx_cb_func)
+  {
+    usb0_ctx->client_ctx[urb->client_id]->app_rx_cb_func(urb->transfer_buffer_ptr, urb->actual_length, 
+      urb->transfer_status, urb->cb_data);
+  }
+}
+
+// This function is not use yet, might use with disconnect?
+void usb_handle_reset(void)
+{
+  USB_ASSERT(usb0_ctx);
+  usb0_ctx->is_enumerated = FALSE;
+  usb_fn_fd()->usb_fd_reset(usb0_ctx->fd_ctx);
+}
+
+// ===========================================================================
+/**
+ * @function    usb_al_hlos_bulk_init
+ * 
+ * @brief   This function initializes the USB core.
+ *
+ * @details This function initializes the USB core, and set signal when
+ *          enumeration is complete. Also init usb bus interrupt
+ * 
+ * @param   speed_required   -  [IN] The maximum speed at which USB should be
+ *                            configured
+ * 
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+void usb_al_hlos_bulk_init(usb_max_speed_required_t speed_required)
+{
+  usb_api_callback_t api_cb;
+
+  if (NULL == usb0_ctx)
+  {
+    USB_LOG_ERR(log_usb_al_hlos_bulk_init__usb_ctx_empty);
+    USB_ASSERT(0);
+  }
+
+  usb_log_buffer_init(&(usb0_ctx->log_ptr));
+
+  usb_fn_util()->usb_os_spinlock_lock();
+
+  if (NULL != usb0_ctx->fd_ctx)
+  {
+    USB_ULOG(BAM_QLOG, "usb_hw_already_Init");
+    USB_LOG_ERR(log_usb_al_hlos_bulk_init__already_enum);
+    usb_fn_util()->usb_os_spinlock_unlock();
+    return;
+  }
+  
+  USB_ULOG_2(BAM_QLOG, "start_init, vbus_high %u, cli_ctx %u", usb0_ctx->vbus_high, usb_fn_al()->usb_client_cnt());
+
+  USB_LOG_1(log_usb_al_hlos_bulk_init__enter_spd_D, speed_required);
+
+  //By default set the core as SNPS core
+  //usb_clock_cb_init(&usb0_ctx->clk_cb);
+
+  api_cb.tx_complete        = usb_fn_al()->usb_tx_complete;
+  api_cb.rx_complete        = usb_fn_al()->usb_rx_complete;
+  api_cb.ctrl_in_cb         = usb_fn_al()->usb_ctrl_in_cb;
+  api_cb.ctrl_out_cb        = usb_fn_al()->usb_ctrl_out_cb;
+  api_cb.notify             = usb_fn_al()->usb_client_notification;
+  api_cb.enum_complete      = usb_fn_al()->usb_al_hlos_enum_complete;
+  api_cb.get_client_config  = usb_fn_al()->usb_client_get_config;
+  api_cb.error              = usb_fn_al()->usb_al_disconnect_cb;
+  api_cb.notify_suspend     = usb_fn_al()->usb_al_notify_suspend;
+
+  usb_fn_fd()->usb_fd_init(&usb0_ctx->fd_ctx, api_cb, &usb0_ctx->dev_cfg, speed_required);
+
+  usb_fn_mem_util()->usb_print_meminfo();
+
+  usb0_ctx->isr_ctx.dci_ctx = usb_fn_fd()->usb_fd_get_dci_ctx(usb0_ctx->fd_ctx);
+
+
+#ifdef USB_KW_CONST_RESULT
+    //condition always yield the same result and causes an unreachable code
+  {
+    uint32 error_code = usb_isr_init(&usb0_ctx->isr_ctx);
+    if (error_code)
+    {
+      USB_LOG_ERR_1(log_usb_al_hlos_bulk_init__fail_D, error_code);
+    }
+  }
+#else
+  usb_fn_isr()->usb_isr_init(&usb0_ctx->isr_ctx);
+#endif
+
+  USB_ULOG(ENG_QLOG, "exit_fd_init");
+  USB_LOG(log_usb_al_hlos_bulk_init__exit);
+
+  //usb_timer_init();
+  usb_fn_util()->usb_os_spinlock_unlock();
+}
+
+// ===========================================================================
+/**
+ * @function    usb_al_hlos_bulk_init
+ * 
+ * @brief   return number of register client
+ *
+ * @details return number of register client (who called USB_OPEN)
+ * 
+ * @param   speed_required   -  [IN] The maximum speed at which USB should be
+ *                            configured
+ * 
+ * @return  number of register client.
+ * 
+ */
+// ===========================================================================
+uint32 usb_client_cnt(void)
+{
+  uint32 i;
+  uint32 cnt =0;
+  for (i=0; i < usb0_ctx->dev_cfg.usb_comp_num_ifc; i++)
+  {
+     if (usb0_ctx->client_ctx[i])
+     {
+        USB_ULOG_2(ENG_QLOG, "ctx_exist 0x%X, idx %u", (uint32)usb0_ctx->client_ctx[i], i);
+        cnt++;
+     }
+  }
+  return cnt;
+}
+
+// ===========================================================================
+/**
+ * @function    usb_deregister_client
+ * 
+ * @brief   remove client_ctx to usb0_ctx
+ *
+ * @details when usb_closed call, remove the client_ctx from usb0_ctx
+ * 
+ * @param   client_ctx   - [IN] Client to deregister
+ * 
+ * @return  None
+ * 
+ */
+// ===========================================================================
+void usb_deregister_client(client_ctx_t* client_ctx)
+{
+  if (NULL == client_ctx)
+  {
+    USB_LOG_ERR(log_usb_deregister_client__null_cli_ctx);
+  }
+  else if (client_ctx->client_id < usb0_ctx->dev_cfg.usb_comp_num_ifc)
+  {
+  usb0_ctx->client_ctx[client_ctx->client_id] = NULL;
+}
+  else
+  {
+    USB_LOG_ERR_1(log_usb_deregister_client__overflow_cli_D, client_ctx->client_id);
+  }
+}
+
+// ===========================================================================
+/**
+ * @function    usb_register_client
+ * 
+ * @brief   add client_ctx to usb0_ctx
+ *
+ * @details when usb_open call, register the client_ctx from usb0_ctx
+ *          all client have unique client_id
+ * 
+ * @param   client_ctx   - [IN] Client to register
+ * 
+ * @return  status - SUCCESS (1) or FAILURE(0)
+ * 
+ */
+// ===========================================================================
+boolean usb_register_client(client_ctx_t* client_ctx)
+{
+  uint8 i;
+  boolean result = FALSE;
+  uint32 num_clients;
+
+  if (NULL == client_ctx)
+  {
+    return result;
+  }
+
+  for (i=0; i < usb0_ctx->dev_cfg.usb_comp_num_ifc; i++)
+  {
+    if ((NULL == usb0_ctx->client_ctx[i]) && (usb0_ctx->dev_cfg.usb_comp[i] == client_ctx->ifc_id))
+    {
+      client_ctx->client_id = i;
+      usb0_ctx->client_ctx[i] = client_ctx;
+      result = TRUE;
+    }
+  }
+
+  if (FALSE == result)
+  {
+    USB_LOG_ERR_1(log_usb_register_client__overflow_cli_D, client_ctx->client_id);
+  }
+
+  num_clients = usb_fn_al()->usb_client_cnt();
+  USB_LOG_1(log_usb_register_client__cli_num_D, num_clients);
+
+  // Initialize hardware only when all clients in USB composition have registered with USB driver.
+  if ((result == TRUE) && (usb0_ctx->dev_cfg.usb_comp_num_ifc == num_clients))
+  {
+    usb_fn_al()->usb_al_hlos_bulk_init((usb_max_speed_required_t)0x0);
+  }
+
+  return result;
+}
+
+
+void* usb_copy_client_data(void* data_in, uint32 size)
+{
+  void* data_out = NULL;
+
+  if(data_in && (size > 0))
+  {
+    USB_ASSERT(data_out = usb_fn_mem_util()->usb_malloc(size));
+    memscpy((void*)data_out, size, data_in, size);
+  }
+
+  return data_out;
+}
+
+// ===========================================================================
+/**
+ * @function    usb_send_tx
+ * 
+ * @brief   submit tx buffer to hardware
+ *
+ * @details pass through function. Submit tx buffer to FD
+ * 
+ * @param   pkt        - [IN] buffer pointer to package
+ *          len        - [IN] number of byte to send in buffer
+ *          req_id     - [IN] Debug purpose, the index of buffer to be send
+ *          client_id  - [IN] Client unique ID
+ *          cb_data    - [IN] client private data pointer
+ * @return  error_msg
+ * 
+ */
+// ===========================================================================
+uint32 usb_send_tx(unsigned char *pkt, uint32 len, uint32 req_id, uint32 client_id, void* cb_data)
+{
+  if (usb0_ctx && (TRUE == usb0_ctx->is_enumerated) && usb0_ctx->vbus_high)
+  {
+    return usb_fn_fd()->usb_fd_tx_pkt(usb0_ctx->fd_ctx, (void *)pkt, len, req_id, client_id, cb_data);    
+  }
+  return USB_ERR_CABLE_DISCONNECT;
+}
+
+// ===========================================================================
+/**
+ * @function  usb_write
+ * 
+ * @brief   Client call this function to submit TX buffer.
+ *
+ * @details Client call this function to submit write buffer. This function only,
+ *          submit the buffer into queue, client still need call usb_signal.
+ *          So USB thtead can submit to hardware.
+ * 
+ * @param   client_ctx  - [IN]  usb_ctx relate to the client
+ *          req         - [IN]  write buffer wrap in client_request_t
+ * 
+ * @return  TRUE,  if queue successful
+ *          FALSE, if queue is full
+ */
+// ===========================================================================
+uint32 usb_write (client_ctx_t* client_ctx, uint8* buf_ptr, uint32 xfer_size, void* cb_data)
+{
+  uint32 err_code = 0;
+  USB_OS_SAFE_ENTER();
+
+  usb_mips_stop(usb_mips__tx_cb);
+
+  usb_mips_start(usb_mips__usb_write);
+
+  if(FALSE == (client_ctx && buf_ptr && xfer_size))
+  {
+     USB_OS_SAFE_LEAVE();
+     return USB_ERR_BAD_PARAM;
+  }
+
+  if (FALSE == (usb0_ctx && usb0_ctx->is_enumerated && usb0_ctx->vbus_high))
+  {
+    USB_OS_SAFE_LEAVE();
+  return USB_ERR_CABLE_DISCONNECT;
+}
+
+  err_code = usb_fn_fd()->usb_fd_tx_pkt(usb0_ctx->fd_ctx, (void*)buf_ptr, xfer_size, 0, client_ctx->client_id, cb_data);
+
+  usb_mips_stop(usb_mips__usb_write);
+
+  USB_OS_SAFE_LEAVE();
+  return err_code;
+}
+
+uint32 usb_send_hid_report(uint32 client_id, usb_hid_bitmask_cmd_t report_mask)
+{
+  if (usb0_ctx && (TRUE == usb0_ctx->is_enumerated) && usb0_ctx->vbus_high)
+  {
+    return usb_fn_fd()->usb_fd_hid_report(usb0_ctx->fd_ctx, report_mask, client_id);    
+  }
+  return USB_ERR_CABLE_DISCONNECT;
+}
+
+// ===========================================================================
+/**
+ * @function    usb_send_rx
+ * 
+ * @brief   submit rx buffer to hardware
+ *
+ * @details pass through function. Submit tx buffer to FD
+ * 
+ * @param   pkt        - [IN] buffer pointer to package
+ *          len        - [IN] size of the buffer
+ *          req_id     - [IN] Debug purpose, the index of buffer to be send
+ *          client_id  - [IN] Client unique ID
+ *          cb_data    - [IN] client private data pointer
+ * @return  error_msg
+ * 
+ */
+// ===========================================================================
+uint32 usb_send_rx(unsigned char *pkt, uint32 len, uint32 req_id, uint32 client_id, void* cb_data)
+{
+  if (usb0_ctx && (TRUE == usb0_ctx->is_enumerated) && usb0_ctx->vbus_high)
+  {
+      return usb_fn_fd()->usb_fd_rx_pkt(usb0_ctx->fd_ctx, pkt, len, req_id, client_id, cb_data);
+    }
+  return USB_ERR_CABLE_DISCONNECT;
+}
+
+// ===========================================================================
+/**
+ * @function  usb_read
+ * 
+ * @brief   Client call this function to submit read buffer.
+ *
+ * @details Client call this function to submit read buffer. This function only,
+ *          submit the buffer into queue, client still need call usb_signal.
+ *          So USB thtead can submit to hardware.
+ * 
+ * @param   client_ctx  - [IN]  usb_ctx relate to the client
+ *          req         - [IN]  read buffer with client_request_t
+ * 
+ * @return  TRUE,  if queue successful
+ *          FALSE, if queue is full
+ */
+// ===========================================================================
+uint32 usb_read (client_ctx_t* client_ctx, uint8* buf_ptr, uint32 buf_size, void* cb_data)
+{
+  uint32 err_code = 0;
+  USB_OS_SAFE_ENTER();
+
+  usb_mips_stop(usb_mips__rx_cb);
+
+  usb_mips_start(usb_mips__usb_read);
+
+  if(FALSE == (client_ctx && buf_ptr && buf_size))
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_BAD_PARAM;
+  }
+
+  if (FALSE == (usb0_ctx && usb0_ctx->is_enumerated && usb0_ctx->vbus_high))
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_CABLE_DISCONNECT;
+  }
+
+  err_code = usb_fn_fd()->usb_fd_rx_pkt(usb0_ctx->fd_ctx, (void*)buf_ptr, buf_size, 0, client_ctx->client_id, cb_data);
+
+  usb_mips_stop(usb_mips__usb_read);
+
+  USB_OS_SAFE_LEAVE();
+  return err_code;
+}
+
+
+// ===========================================================================
+/**
+ * @function    usb_check_enum
+ * 
+ * @brief   Return if usb is already enumerate
+ * 
+ * @param   None
+ *
+ * @return  boolean is_enumerated
+ * 
+ */
+// ===========================================================================
+
+boolean usb_check_enum(void)
+{
+  USB_ASSERT(usb0_ctx);
+  return usb0_ctx->is_enumerated;
+}
+
+// ===========================================================================
+/**
+ * @function    usb_get_max_packet_sizes
+ * 
+ * @brief   return max package size base on the speed
+ *
+ * @details pass through function
+ *          return max package size base on the speed
+ * 
+ * @param   none
+ *
+ * @return  return max packet size
+ * 
+ */
+// ===========================================================================
+uint32 usb_get_max_packet_size (void)
+{
+  USB_ASSERT(usb0_ctx && usb0_ctx->fd_ctx);
+  return usb_fn_fd()->usb_fd_get_max_packet_size(usb0_ctx->fd_ctx);
+}
+
+// ===========================================================================
+/**
+ * @function    usb_al_remove_thread
+ * 
+ * @brief   Removes usb thread and system resources acquired by USB driver.
+ *
+ * @details This will remove all system resources acquired by USB thread.
+ *          Including usb_hardware, Vbus, and software contexts.
+ *          Used only when USB driver has its independent thread.
+ * 
+ * @param   none
+ *
+ * @return  none
+ * 
+ */
+// ===========================================================================
+void usb_remove_thread(void)
+{
+  usb_fn_al()->usb_shutdown();
+  usb_fn_mem_util()->usb_mem_deinit();
+  usb_fn_al()->usb_ctx_free();
+}
+
+client_ctx_t* usb_alloc_register_client_ctx(usb_ifc_id ifc_id, usb_event_func_t event_cb, 
+  usb_func_cb_t rx_cb, usb_func_cb_t tx_cb, void* data, uint32 data_size)
+{
+  client_ctx_t* client_ctx_ptr;
+
+  USB_ASSERT(client_ctx_ptr = (client_ctx_t*) usb_fn_mem_util()->usb_malloc(sizeof(client_ctx_t)));
+
+  client_ctx_ptr->ifc_id            = ifc_id;
+  client_ctx_ptr->app_event_cb_func = event_cb;
+  client_ctx_ptr->app_rx_cb_func    = rx_cb;
+  client_ctx_ptr->app_tx_cb_func    = tx_cb;
+  client_ctx_ptr->data_size         = data_size;
+  client_ctx_ptr->data              = usb_fn_al()->usb_copy_client_data(data, data_size);
+
+  // Check if client is present in USB composition and allocates unique client ID.
+  if(FALSE == usb_fn_al()->usb_register_client(client_ctx_ptr))
+  {
+    usb_fn_mem_util()->usb_free((void**)&client_ctx_ptr);
+    return NULL;
+  }
+
+  return client_ctx_ptr;
+}
+
+uint32 usb_isoc_in(client_ctx_t* client_ctx, uint8* buf_ptr, uint32 buf_size, void* cb_data)
+{
+  uint32 err_code = 0;
+  USB_OS_SAFE_ENTER();
+
+  if(!(client_ctx && buf_ptr && buf_size))
+  {
+     USB_LOG_ERR_1(log_usb_isoc_in__bad_input_client_ctx_D, (uint32)client_ctx);
+     USB_OS_SAFE_LEAVE();
+     return USB_ERR_BAD_PARAM;        
+  }
+
+  USB_ULOG_4(BAM_QLOG, "client_id %u, req_id %u, size %u, ptr 0x%X", client_ctx->client_id, 
+    0, buf_size, (uint32) buf_ptr);
+
+  err_code = usb_fn_al()->usb_send_tx((void *)buf_ptr, buf_size, 0, client_ctx->client_id, cb_data);
+  if (err_code != USB_SUCCESS)
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_WRITE;
+  }
+
+  USB_OS_SAFE_LEAVE();
+  return USB_SUCCESS;
+}
+
+uint32 usb_isoc_out (client_ctx_t* client_ctx, uint8* buf_ptr, uint32 buf_size, void* cb_data)
+{
+  uint32 err_code = 0;
+  USB_OS_SAFE_ENTER();
+
+  if(!(client_ctx && buf_ptr && buf_size))
+  {
+     USB_LOG_ERR_1(log_usb_isoc_out__bad_input_client_ctx_D, (uint32)client_ctx);
+     USB_OS_SAFE_LEAVE();
+     return USB_ERR_BAD_PARAM;
+  }
+
+  USB_ULOG_4(BAM_QLOG, "client_id %u, req_id %u, size %u, ptr 0x%X", client_ctx->client_id, 
+    0, buf_size, (uint32) buf_ptr);
+
+  err_code = usb_fn_al()->usb_send_rx((void *)buf_ptr, buf_size, 0, client_ctx->client_id, cb_data);
+  if(err_code != USB_SUCCESS)
+  {        
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_READ;
+  }
+  
+  USB_OS_SAFE_LEAVE();
+  return USB_SUCCESS;
+}
+
+uint32 usb_open_ctrl (ctrl_client_ctx_t** client_ctx, usb_ifc_id ifc_id,
+  boolean (*ctrl_out_cb)(usb_setup_t* cmd_ptr, uint8* payload, uint32 payload_size), 
+  boolean (*ctrl_in_cb)(usb_setup_t* cmd_ptr, uint8* payload, uint32* payload_size))
+{
+  ctrl_client_ctx_t* ctrl_client;
+
+  USB_OS_SAFE_ENTER();
+  USB_ULOG_1(BUS_QLOG, "enter ctrl interface %u", ifc_id);
+ 
+  if (0 == (client_ctx && ctrl_out_cb && ctrl_in_cb))
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_BAD_PARAM;
+  }
+
+  if (ifc_id != USB_IFC_ID_AUDIO_TUNING)
+  {
+    USB_ULOG_1(DBG_E_QLOG, "Error: invalid iface_id=(%d)", ifc_id);
+    *client_ctx =NULL;
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_BAD_PARAM;
+  }
+
+  USB_ASSERT(ctrl_client = (ctrl_client_ctx_t*)usb_fn_mem_util()->usb_malloc(sizeof(ctrl_client_ctx_t)));
+
+  ctrl_client->ifc_id = ifc_id;
+  ctrl_client->ctrl_out_cb = ctrl_out_cb;
+  ctrl_client->ctrl_in_cb = ctrl_in_cb;
+  usb_fn_al()->usb_register_ctrl_client(ctrl_client);
+  *client_ctx = ctrl_client;
+  USB_OS_SAFE_LEAVE();
+  return USB_SUCCESS;
+}
+
+uint32 usb_open_audio_stream(client_ctx_t** client_ctx, usb_ifc_id ifc_id, 
+  usb_audio_stream_open_cfg_t* cfg, usb_event_func_t event_cb, usb_func_cb_t data_cb)
+{
+  USB_OS_SAFE_ENTER();
+
+  if (!(client_ctx && event_cb && data_cb && cfg))
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_BAD_PARAM;
+  }
+
+  switch(ifc_id)
+  {
+    case USB_IFC_ID_AUDIO_STREAMING_MIC:
+    {
+      *client_ctx = usb_fn_al()->usb_alloc_register_client_ctx(ifc_id, event_cb, NULL, data_cb, cfg, 
+        sizeof(usb_audio_stream_open_cfg_t));
+    }
+    break;
+
+    case USB_IFC_ID_AUDIO_STREAMING_SPEAKER:
+    {
+
+      *client_ctx = usb_fn_al()->usb_alloc_register_client_ctx(ifc_id, event_cb, data_cb, NULL, cfg, 
+        sizeof(usb_audio_stream_open_cfg_t));
+    }
+    break;
+
+    default:
+      *client_ctx = NULL;
+      USB_OS_SAFE_LEAVE();
+      return USB_ERR_BAD_PARAM;
+  }
+
+  if(NULL == (*client_ctx))
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_MEM_OVERFLOW;
+  }
+
+  USB_OS_SAFE_LEAVE();
+  return USB_SUCCESS;
+}
+
+uint32 usb_open_audio_ctrl(client_ctx_t** client_ctx, usb_ifc_id ifc_id, 
+usb_audio_ctrl_open_cfg_t* cfg,  usb_event_func_t event_cb)
+{
+  USB_OS_SAFE_ENTER();
+
+  if (!(client_ctx && cfg && event_cb && (ifc_id == USB_IFC_ID_AUDIO_CONTROL)))
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_BAD_PARAM;
+  }
+
+  *client_ctx = usb_fn_al()->usb_alloc_register_client_ctx(USB_IFC_ID_AUDIO_CONTROL, event_cb, NULL, 
+    NULL, cfg, sizeof(usb_audio_ctrl_open_cfg_t));
+
+  if(NULL == (*client_ctx))
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_MEM_OVERFLOW;
+  }
+
+  USB_OS_SAFE_LEAVE();
+  return USB_SUCCESS;
+}
+
+uint32 usb_open_dfu (client_ctx_t** client_ctx, usb_ifc_id ifc_id, usb_dfu_open_cfg_t* cfg,
+  usb_event_func_t event_cb)
+{
+  USB_OS_SAFE_ENTER();
+
+  if (!(client_ctx && event_cb && cfg && (ifc_id == USB_IFC_ID_DFU)))
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_BAD_PARAM;
+  }
+
+  *client_ctx = usb_alloc_register_client_ctx(USB_IFC_ID_DFU, event_cb, NULL, NULL, 
+    (void*) cfg, sizeof(usb_dfu_open_cfg_t));
+
+  if(NULL == (*client_ctx))
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_MEM_OVERFLOW;
+  }
+
+  USB_OS_SAFE_LEAVE();
+  return USB_SUCCESS;
+}
+
+uint32 usb_hid_open(client_ctx_t** client_ctx, usb_ifc_id ifc_id)
+{
+  client_ctx_t* hid_client;
+
+  USB_OS_SAFE_ENTER();
+  USB_ULOG_1(BUS_QLOG, "enter HID interface %u", ifc_id);
+
+  if (NULL == client_ctx)
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_BAD_PARAM;
+  }
+
+  if (ifc_id != USB_IFC_ID_HID)
+  {
+    USB_ULOG_1(DBG_E_QLOG, "Error: invalid iface_id=(%d)", ifc_id);
+    *client_ctx =NULL;
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_BAD_PARAM;
+  }
+
+  USB_ASSERT(hid_client = (client_ctx_t*)usb_fn_mem_util()->usb_malloc(sizeof(client_ctx_t)));
+  hid_client->ifc_id = ifc_id;
+  usb_fn_al()->usb_register_client(hid_client);
+
+  *client_ctx = hid_client;
+  USB_OS_SAFE_LEAVE();
+  return USB_SUCCESS;
+}
+
+uint32 usb_hid_report(client_ctx_t* client_ctx, usb_hid_bitmask_cmd_t report)
+{
+  if (NULL == client_ctx)
+  {
+    return USB_ERR_CLIENT_NOT_OPEN;
+  }
+
+#ifdef USB_KW_CONST_RESULT
+  //condition always yield the same result and causes an unreachable code 
+  if (report > HID_MAX)
+  {
+    return USB_ERR_BAD_PARAM;
+  }
+#endif
+
+  usb_fn_al()->usb_send_hid_report(client_ctx->client_id, report);
+
+  return USB_SUCCESS;
+}
+
+uint32 usb_open (client_ctx_t** client_ctx, usb_ifc_id ifc_id, void* data,
+  usb_event_func_t event_cb, usb_func_cb_t rx_cb, usb_func_cb_t tx_cb,
+  uint32 rx_buf_num, uint32 tx_buf_num)
+{ 
+  client_ctx_t* client_ctx_ptr;
+  USB_OS_SAFE_ENTER();
+
+  USB_ULOG_1(BUS_QLOG, "enter interface %u", ifc_id);
+  
+  if (0 == (client_ctx && event_cb && rx_cb && tx_cb))
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_BAD_PARAM;
+  }
+
+#ifdef USB_KW_CONST_RESULT
+      //condition always yield the same result and causes an unreachable code
+  if (ifc_id > USB_IFC_ID_MAX)
+  {
+    USB_ULOG_1(DBG_E_QLOG, "Error: iface_id=(%d)", ifc_id);
+    usb_error_log(USB_OPEN_BAD_IFACE_LOG, 0, ifc_id);
+
+    *client_ctx =NULL;  
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_BAD_PARAM;
+  }
+#endif
+  
+  USB_ASSERT(client_ctx_ptr = (client_ctx_t*) usb_fn_mem_util()->usb_malloc(sizeof(client_ctx_t)));
+
+  //Register client_ctx
+  *client_ctx = client_ctx_ptr;
+
+  // Initialize client_ctx
+  client_ctx_ptr->ifc_id = ifc_id;
+  client_ctx_ptr->data = NULL;
+  client_ctx_ptr->app_event_cb_func = event_cb;
+  client_ctx_ptr->app_rx_cb_func = rx_cb;
+  client_ctx_ptr->app_tx_cb_func = tx_cb;
+
+  // Check if client is present in USB composition and allocates unique client ID.
+  if(FALSE == usb_fn_al()->usb_register_client(client_ctx_ptr))
+  {
+    USB_OS_SAFE_LEAVE();
+    return USB_ERR_BAD_PARAM;
+  }
+
+  // if usb_enum_complete already happend, trigger enum_cb directly.
+  if(usb_fn_al()->usb_check_enum())
+  {
+    USB_ULOG_1(BUS_QLOG, "usb enumerated", TRUE);
+    client_ctx_ptr->app_event_cb_func(USB_EVENT_ENABLED, NULL);
+  }
+
+  USB_OS_SAFE_LEAVE();
+  return USB_SUCCESS;
+}
+
+uint32 usb_close (client_ctx_t* client_ctx)
+{
+  uint32 error_code = USB_SUCCESS;
+  USB_OS_SAFE_ENTER();
+
+  if (NULL == client_ctx)
+  {
+    USB_LOG_ERR(log_usb_close__null_cli_ctx);
+    error_code= USB_ERR_CLIENT_NOT_OPEN;
+  }
+  else if (FALSE == usb_fn_al()->usb_internal_close(client_ctx))
+  {
+    USB_ULOG(DBG_E_QLOG,"usb_close, Fail");
+    error_code= USB_ERR_UNKNOWN;
+  }
+  USB_OS_SAFE_LEAVE();
+  return error_code;
+}
+
+// ===========================================================================
+/**
+ * @function    usb_shutdown
+ * 
+ * @brief   shutdown the usb_hardware, log.
+ *
+ * @details This will shutdown usb_hardware, usb bus event, log,
+ *          but will keep client_ctx and usb0_ctx, vbus, and usb_thread stuff          
+ *          Call usb_al_hlos_bulk_init to restore usb
+ * @param   none
+ *
+ * @return  none
+ * 
+ */
+// ===========================================================================
+void usb_shutdown(void)
+{
+  USB_LOG(log_usb_shutdown);
+  usb_fn_isr()->usb_isr_uninit(&(usb0_ctx->isr_ctx));
+  usb_fn_fd()->usb_fd_shutdown(&usb0_ctx->fd_ctx); 
+  usb0_ctx->is_enumerated = FALSE;
+  usb_fn_mem_util()->usb_print_meminfo();
+}
+
+// ===========================================================================
+/**
+ * @function    usb_return_buffer
+ * 
+ * @brief   This function return all rx and tx buffer between client & usb
+ *
+ * @details This function return all rx and tx buffer between client & usb.
+ *          First return all buffer pending in hardware, then return the buffer
+ *          in the buffer queue
+ * 
+ * @param   client_ctx
+ * 
+ * @return  None
+ * 
+ */
+// ===========================================================================
+void usb_return_buffer(client_ctx_t* client_ctx)
+{
+  uint32 err =0;
+  USB_ASSERT(client_ctx);
+  err = usb_fn_fd()->usb_fd_cancel_transfer(usb0_ctx->fd_ctx, client_ctx->client_id);
+  if (err)
+  {
+    USB_ULOG_1(DBG_E_QLOG, "Fail_dequeue_read_q, id %u", client_ctx->client_id);
+  }
+  USB_ULOG_1(BAM_QLOG, "iface_close %u", err);  
+}
+
+// ===========================================================================
+/**
+ * @function  usb_internal_close
+ * 
+ * @brief   USB return all the rx, tx buffer back to client, and dealloc cli_ctx
+ *
+ * @details Client call usb_close to cancel all the transfer and return all the
+ *          buffer back through rx, tx callback. After return all the buffer,
+ *          destroy client_ctx and trigger event_cb with USB_EVENT_CLOSE_COMPLETE
+ * 
+ * @param   client_ctx  - [IN]  usb_ctx relate to the client
+ *
+ * 
+ * @return  TRUE,  if successful
+ *          FALSE, if fail
+ */
+// ===========================================================================
+boolean usb_internal_close(client_ctx_t* client_ctx)
+{
+  uint32 num_clients;
+  USB_ASSERT(client_ctx);
+
+  usb_fn_al()->usb_return_buffer(client_ctx);
+  
+  if(client_ctx->app_event_cb_func)
+  {
+    client_ctx->app_event_cb_func(USB_EVENT_CLOSE_COMPLETE, NULL);
+  }
+
+  usb_fn_al()->usb_deregister_client(client_ctx);
+
+  if(client_ctx->data) 
+  {
+    usb_fn_mem_util()->usb_free((void**)&client_ctx->data);
+  }
+
+  usb_fn_mem_util()->usb_free((void**)&client_ctx);
+
+  num_clients = usb_fn_al()->usb_client_cnt();
+
+  if (0 == num_clients)
+  {
+    USB_ULOG(BAM_QLOG, "all_client_close");
+    usb_fn_al()->usb_shutdown();
+  }
+  else
+  {
+    USB_ULOG_1(BAM_QLOG, "number of client left %u", num_clients);
+  }
+  
+  return TRUE;
+}
+
+// ===========================================================================
+/**
+ * @function  usb_handle_signal
+ * 
+ * @brief   Handles various events signaled to USB thread.
+ *
+ * @details Handles various events signaled to USB thread from other threads 
+ *          and interrupt contexts. List of signals handled is below -
+ *          1) USB0_TASK_EVENT_QUEUE_SIG - events generated from USB controller
+ *          2) USB0_TASK_PWR_EVENT_QUEUE_SIG - events generated by power event interrupt
+ *          3) USB0_TASK_VBUS_EVENT_SIG - event generated by Vbus interrupt.
+ * 
+ * @param   client_sig - [IN] - Current state of USB thread signals.
+ *
+ * @return  None
+ *
+ */
+// ===========================================================================
+void usb_handle_signal(uint32 client_sig)
+{
+  usb_mips_start(usb_mips__usb_al_hlos_handle);
+
+  if (NULL == usb0_ctx)
+  {
+    USB_LOG_ERR(log_usb_al_hlos_handle__ctx_not_exist);
+    return;
+  }
+
+  if (usb0_ctx->fd_ctx && (client_sig & USB0_TASK_EVENT_QUEUE_SIG ))
+  {
+    USB_OS_SAFE_ENTER();    
+    usb_mips_start(usb_mips__usb_intr_dsr);
+    usb_fn_isr()->usb_dsr_handle_ee_event(&(usb0_ctx->isr_ctx));
+    usb_mips_stop(usb_mips__usb_intr_dsr);
+    USB_OS_SAFE_LEAVE();
+  }
+
+  if (usb0_ctx->fd_ctx && (client_sig & USB0_TASK_PWR_EVENT_QUEUE_SIG ))
+  {
+    USB_OS_SAFE_ENTER();    
+    usb_fn_isr()->usb_dsr_handle_pwr_event(&(usb0_ctx->isr_ctx));
+    USB_OS_SAFE_LEAVE();
+  }
+
+  //VBUS connect action
+  if (client_sig & USB0_TASK_VBUS_EVENT_SIG )
+  {
+    uint8 idx=0;
+    USB_OS_SAFE_ENTER();
+    USB_ULOG(BUS_QLOG,"Signal Received - USB0_TASK_PWR_EVENT_QUEUE_SIG");
+    USB_LOG_1(log_usb_al_hlos_handle__vbus_event_D, usb0_ctx->vbus_high);
+    if (usb0_ctx->vbus_high == 0)
+    {
+      USB_ULOG_1(DBG_E_QLOG, "bus_detect low %u", usb0_ctx->vbus_high); 
+      if (usb0_ctx->is_enumerated)
+      {
+        usb_fn_al()->usb_al_hlos_disconnect_handler();
+        for (idx=0; idx < usb0_ctx->dev_cfg.usb_comp_num_ifc; idx++)
+        {
+          if ((NULL != usb0_ctx->client_ctx[idx]) &&
+              (NULL != usb0_ctx->client_ctx[idx]->app_event_cb_func))
+          {
+            usb0_ctx->client_ctx[idx]->app_event_cb_func(USB_EVENT_DISCONNECT, NULL);
+          }
+        }
+      }
+      else
+      {
+        USB_LOG_1(log_usb_al_hlos_handle__vbus_event_skip_is_enum_D, usb0_ctx->is_enumerated);
+      }
+    }
+    else if (usb0_ctx->vbus_high == 1)
+    {
+      if (FALSE == usb0_ctx->is_enumerated)
+      {
+        USB_ULOG_1(DBG_E_QLOG, "bus_detect high %u", usb0_ctx->vbus_high);
+        if(usb0_ctx->dev_cfg.usb_comp_num_ifc == usb_fn_al()->usb_client_cnt())
+        {
+          usb_fn_al()->usb_al_hlos_bulk_init((usb_max_speed_required_t)0x0);
+        }
+      }
+      else
+      {
+        USB_LOG_1(log_usb_al_hlos_handle__vbus_event_skip_is_enum_D, usb0_ctx->is_enumerated);
+      }
+    }
+    USB_OS_SAFE_LEAVE();
+  } 
+
+  if (usb0_ctx->fd_ctx && (client_sig & USB0_TASK_ENUM_DONE_SIG ))
+  {
+    uint8 idx=0;
+    USB_OS_SAFE_ENTER();
+    USB_ULOG(BUS_QLOG,"Signal Received - USB0_TASK_ENUM_DONE_SIG");
+     
+    /* Notify all clients of enumeration */
+    for (idx=0; idx < usb0_ctx->dev_cfg.usb_comp_num_ifc; idx++)
+    {
+        if ((NULL != usb0_ctx->client_ctx[idx]) &&
+            (NULL != usb0_ctx->client_ctx[idx]->app_event_cb_func))
+        {
+          // TODO: kameya - re-enable events with audio client
+           usb0_ctx->client_ctx[idx]->app_event_cb_func(USB_EVENT_ENABLED, NULL);
+        }
+    }
+    USB_OS_SAFE_LEAVE();
+  }
+
+  if (usb0_ctx->fd_ctx && (client_sig & USB0_TASK_LOG_TIMER_EXP_SIG))
+  {
+    USB_OS_SAFE_ENTER();
+    usb_log_read_send_ulog();
+    USB_OS_SAFE_LEAVE();
+  }
+  usb_mips_stop(usb_mips__usb_al_hlos_handle);
+}
+
+// ===========================================================================
+/**
+ * @function    usb_thread_main
+ * 
+ * @brief   Entry API for USB driver thread.
+ *
+ * @details If usb thread is created through usb_create_thread then 
+ *          usb thread will run independently on its own through this funtion.
+ * 
+ * @param   args
+ * 
+ * @return  None
+ * 
+ */
+// ===========================================================================
+void usb_thread_main(void* data)
+{
+  uint32 mask;
+
+  //MUTEX_INIT
+  usb_fn_util()->usb_os_spinlock_init();
+
+  while (1)
+  {
+    mask = qurt_signal2_wait(usb_sigs_ptr, 
+      USB0_TASK_EVENT_QUEUE_SIG      |  /* Pending event request from HW */
+      USB0_TASK_PWR_EVENT_QUEUE_SIG  |   
+      USB0_TASK_VBUS_EVENT_SIG       |   
+      USB0_TASK_ENUM_DONE_SIG,          /* Wait for enumeration event */
+      QURT_SIGNAL_ATTR_WAIT_ANY);       /* Go off line   */
+
+    qurt_signal2_clear(usb_sigs_ptr, mask);
+
+    usb_api()->usb_handle_signal(mask);
+  }
+}
+
+void usb_thread_init(void* sig_ptr)
+{
+  usb_sigs_ptr = (qurt_signal2_t*)sig_ptr;
+
+  //MUTEX_INIT
+  usb_fn_util()->usb_os_spinlock_init();
+
+  //USB0_INIT
+  usb_fn_mem_util()->usb_mem_init();
+  usb_fn_al()->usb_ctx_init();
+  usb_log_buffer_init(&usb0_ctx->log_ptr);
+}
+
+// ===========================================================================
+/**
+ * @function    usb_create_thread
+ * 
+ * @brief   This function will create USB driver thread.
+ *
+ * @details This function will create and register USB driver thread and signals
+ *          with OS. Essential when using independent USB thread.
+ * 
+ * @param   None.
+ * 
+ * @return  TRUE: when thread create successful.
+ *          FALSE: when thread create fail.
+ * 
+ */
+// ===========================================================================
+boolean usb_create_thread(void)
+{
+ qurt_thread_attr_t thread_attr;
+ int status; 
+
+ qurt_signal2_init(&usb_hlos_sigs);
+ 
+ qurt_thread_attr_init (&thread_attr);
+ qurt_thread_attr_set_name (&thread_attr, "USB0");
+ usb_thread_stack = malloc(USB_HLOS_THREAD_STACK_SIZE);
+ qurt_thread_attr_set_stack_size (&thread_attr, USB_HLOS_THREAD_STACK_SIZE);
+ qurt_thread_attr_set_stack_addr (&thread_attr, (unsigned long long *)usb_thread_stack);
+ qurt_thread_attr_set_priority (&thread_attr, (unsigned short)20);
+ status = qurt_thread_create(&(usb_hlos_id), &thread_attr, usb_fn_al()->usb_thread_main, NULL);
+ 
+ if(status != QURT_EOK)
+ {
+   USB_ASSERT(0);
+ }
+  
+  usb_api()->usb_thread_init(&usb_hlos_sigs);
+  return TRUE;
+}
+
+/*----------------------------------------------------------------------------
+ * Function table definitions
+ * -------------------------------------------------------------------------*/
+
+usb_fn_tbl_al_t fn_tbl_al = 
+{
+  usb_get_str_dsc_from_acdb_str,
+  usb_set_comp_profile,
+  usb_set_audio_rev,
+  usb_set_audio_profile,
+  usb_client_get_config,
+  usb_client_notification,
+  usb_ctrl_out_cb,
+  usb_ctrl_in_cb,
+  usb_register_ctrl_client,
+  usb_al_hlos_isr_vbus_event,
+  usb_al_hlos_isr_pwr_event,
+  usb_al_hlos_log_timer_cb,
+  usb_al_hlos_enum_complete,
+  usb_al_hlos_disconnect_handler,
+  usb_al_disconnect_cb,
+  usb_al_notify_suspend,
+  usb_ctx_init,
+  usb_ctx_free,
+  usb_tx_complete,
+  usb_rx_complete,
+  usb_handle_reset,
+  usb_al_hlos_bulk_init,
+  usb_client_cnt,
+  usb_deregister_client,
+  usb_register_client,
+  usb_copy_client_data,
+  usb_send_tx,
+  usb_send_hid_report,
+  usb_send_rx,
+  usb_check_enum,
+  usb_get_max_packet_size,
+  usb_remove_thread,
+  usb_alloc_register_client_ctx,
+  usb_shutdown,
+  usb_return_buffer,
+  usb_internal_close,
+  usb_thread_main,
+  usb_create_thread,
+  usb_log_read_send_ulog,
+};
+
+usb_fn_tbl_api_t fn_tbl_api = 
+{
+  usb_set_params,
+  usb_write,
+  usb_read,
+  usb_isoc_in,
+  usb_isoc_out,
+  usb_open_ctrl,
+  usb_open_audio_stream,
+  usb_open_audio_ctrl,
+  usb_open_dfu,
+  usb_hid_open,
+  usb_hid_report,
+  usb_open,
+  usb_close,
+  usb_handle_signal,
+  usb_thread_init,
+  usb_log_open,
+  usb_log_close,
+};
+

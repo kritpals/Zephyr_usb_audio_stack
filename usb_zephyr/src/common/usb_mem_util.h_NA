@@ -1,0 +1,30 @@
+#ifndef USB_MEM_UTIL_H
+#define USB_MEM_UTIL_H
+
+#include "comdef.h"           // common defines - basic types as uint32 etc
+#include "err.h"              // ERR_FATAL
+#include "usb_util.h"
+
+typedef struct usb_fn_tbl_mem_util
+{
+  void (*usb_mem_barrier)(void);
+  void* (*usb_mem_attr_uncached)(void* ptr);
+  void* (*usb_mem_attr_writethrough)(void* ptr);
+  void* (*usb_mem_attr_uncached_inv)(void* ptr, uint32 size);
+  void (*usb_mem_init)(void);
+  void (*usb_mem_deinit)(void);
+  void* (*usb_malloc)(uint32 size);
+  void* (*usb_malloc_uncached)(uint32 size);
+  void (*usb_free)(void** mem_vaddr);
+  uint32 (*usb_print_meminfo)(void);
+} usb_fn_tbl_mem_util_t;
+
+/*===========================================================================
+FUNCTION from usb_mem_util.c
+===========================================================================*/
+
+extern usb_fn_tbl_mem_util_t fn_tbl_mem_util;
+#define usb_fn_mem_util(ctx)    (&fn_tbl_mem_util)
+
+#endif /*USB_MEM_UTIL_H*/
+

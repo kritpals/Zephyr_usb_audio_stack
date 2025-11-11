@@ -1,0 +1,311 @@
+#ifndef USB_AUDIO_CLASS_30_H
+#define USB_AUDIO_CLASS_30_H
+/*=======================================================================*//**
+  @file usb_audio_class_30.h
+
+  USB Audio Class 3.0 specification implementation
+
+  @file         usb_audio_class_30.h
+ 
+  @brief       Class specific header documentation.
+  
+  @details    USB Audio Class 3.0 specification implementation
+
+                 Copyright (c) 2017 Qualcomm Technologies Inc.
+                 All Rights Reserved.
+                 Qualcomm Confidential and Proprietary
+*/
+/*========================================================================*/
+/*  $Header: //components/rel/audio.whs/1.0/mcu_proc/core/wiredconnectivity/usb/src/func/usb_audio_class_30.h#5 $ */
+
+/*----------------------------------------------------------------------------
+ * Include Files
+ * -------------------------------------------------------------------------*/
+#include "usb_urb.h"
+#include "usb_dcd_ch9.h" /* for USB descriptor types */
+#include "usb_common.h"
+#include "usb_dcd.h"
+#include "usb_api.h"
+#include "usb_fd.h"
+#include "usb_audio_fd.h"
+
+//----------------------------------------------------------------------------
+// Preprocessor Definitions and Constants
+//----------------------------------------------------------------------------
+
+// Reference: UAC3.0 - Section A.2 - Audio Function Subclass Codes
+// Profile IDs
+#define UAC30_PROFILE_ID_FULL_ADC_3_0             (0x01)
+#define UAC30_PROFILE_ID_GENERIC_IO               (0x20)
+#define UAC30_PROFILE_ID_HEADPHONE                (0x21)
+#define UAC30_PROFILE_ID_SPEAKER                  (0x22)
+#define UAC30_PROFILE_ID_MICROPHONE               (0x23)
+#define UAC30_PROFILE_ID_HEADSET                  (0x24)
+#define UAC30_PROFILE_ID_HEADSET_ADAPTER          (0x25)
+#define UAC30_PROFILE_ID_SPEAKERPHONE             (0x26)
+
+//----------------------------------------------------------------------------
+// Type Declarations
+//----------------------------------------------------------------------------
+
+// Reference   : UAC 3.0 Specification
+// Table 4-15 : Class-Specific AC Interface Header Descriptor
+typedef PACKED struct uac3_ac_cs_ifc_header
+{
+  uint8   bLength;            // 10 bytes
+  uint8   bDescriptorType;    // CS_INTERFACE
+  uint8   bDescriptorSubType; // HEADER descriptor subtype
+  uint8   bCategory;          // USB_AUDIO_FN_CATEGORY_HEADSET
+  uint16  wTotalLength;
+  uint32  bmControls;
+}
+PACKED_POST uac3_cs_ac_ifc_header_t;
+
+// Reference   : UAC 3.0 Specification
+// Table 4-43 : Clock Source Descriptor
+typedef PACKED struct uac3_ac_csrc_desc
+{
+  uint8   bLength;              // 12 bytes
+  uint8   bDescriptorType;      // CS_INTERFACE
+  uint8   bDescriptorSubType;   // CLOCK_SOURCE
+  uint8   bClockID;             // Terminal ID of clock
+  uint8   bmAttributes;
+  uint32  bmControls;
+  uint8   bReferenceTerminal;
+  uint16  wClockSourceStr;
+}
+PACKED_POST uac3_ac_csrc_desc_t;
+
+// Reference   : UAC 3.0 Specification
+// Table 4-44 : Clock Selector Descriptor
+typedef PACKED struct uac3_ac_csel_desc
+{
+  uint8   bLength;              // 8 bytes
+  uint8   bDescriptorType;      // CS_INTERFACE
+  uint8   bDescriptorSubType;   // CLOCK_SOURCE
+  uint8   bClockID;             // Terminal ID of clock
+  uint8   bNrPins;              // 0x1 - hard coded
+  uint8   baCSourceID;
+  uint32  bmControls;
+  uint16  wCSelectorDescrStr;
+}
+PACKED_POST uac3_ac_csel_desc_t;
+
+// Reference   : UAC 3.0 Specification
+// Table 4-16 : Input Terminal Descriptor
+typedef PACKED struct uac3_ac_it_desc
+{
+  uint8   bLength;             // 20 bytes
+  uint8   bDescriptorType;     // CS_INTERFACE
+  uint8   bDescriptorSubType;  // INPUT_TERMINAL           
+  uint8   bTerminalID;
+  uint16  wTerminalType;
+  uint8   bAssocTerminal;
+  uint8   bCSourceID;
+  uint32  bmControls;
+  uint16  wClusterDescrID;
+  uint16  wExTerminalDescrID;
+  uint16  wConnectorsDescrID;
+  uint16  wTermDescrStr;
+}
+PACKED_POST uac3_ac_it_desc_t;
+
+// Reference   : UAC 3.0 Specification
+// Table 4-3   : Cluster Header Descriptor.
+typedef PACKED struct uac3_ac_cl_header_desc
+{
+  uint16  wLength;
+  uint8   bDescriptorType;    
+  uint8   bDescriptorSubType;
+  uint16  wDescriptorID;
+  uint8   bNrChannels;
+}
+PACKED_POST uac3_ac_cl_header_desc_t;
+
+// Reference   : UAC 3.0 Specification
+// Table 4-9   : Cluster Information Segment Descriptor.
+typedef PACKED struct uac3_ac_cl_seg_inf_desc
+{
+  uint16  wLength;
+  uint8   bSegmentType;
+  uint8   bChPurpose;
+  uint8   bChRelationship;
+  uint8   bChGroupID;
+  uint16  wLengthEndSeg;
+  uint8   bSegmentTypeEnd;
+}
+PACKED_POST uac3_ac_cl_seg_inf_desc_t;
+
+
+// Reference   : UAC 3.0 Specification
+// Table 4-17 : Output Terminal Descriptor
+typedef PACKED struct uac3_ac_ot_desc
+{
+  uint8   bLength;             // 19 bytes
+  uint8   bDescriptorType;     // CS_INTERFACE
+  uint8   bDescriptorSubType;  // OUTPUT_TERMINAL           
+  uint8   bTerminalID;
+  uint16  wTerminalType;
+  uint8   bAssocTerminal;
+  uint8   bSourceID;
+  uint8   bCSourceID;
+  uint32  bmControls;
+  uint16  wExTerminalDescrID;
+  uint16  wConnectorsDescrID;
+  uint16  wTerminalDescrStr;
+}
+PACKED_POST uac3_ac_ot_desc_t;
+
+// Reference   : UAC 3.0 Specification
+// Table 4-31 : Feature Unit Descriptor
+typedef PACKED struct uac3_ac_fu_desc
+{
+  uint8   bLength;              // 9 bytes + (4 * n_ch) + 2 (iFeature)
+  uint8   bDescriptorType;      // CS_INTERFACE
+  uint8   bDescriptorSubType;   // FEATURE_UNIT
+  uint8   bUnitID;
+  uint8   bSourceID;
+  uint32  bmaControls0;         // master channel contol
+  // Dynamically populated by UAC 2.0 API
+  // uint32 bmaControls(n) 
+  // uint16 wFeatureDescrStr
+}
+PACKED_POST uac3_ac_fu_desc_t;
+
+// Reference   : UAC 3.0 Specification
+// Table 4-29 : Mixer Unit Descriptor
+typedef PACKED struct uac3_ac_mu_desc
+{
+  uint8   bLength;              // 16 bytes
+  uint8   bDescriptorType;      // CS_INTERFACE
+  uint8   bDescriptorSubType;   // MIXER_UNIT
+  uint8   bUnitID;
+  uint8   bNrInPins;
+  uint8   baSourceID1;
+  uint8   baSourceID2;
+  uint16  wClusterDescrID;
+  uint8   bmMixerControls;
+  uint32  bmControls;
+  uint16  wMixerDescrStr;  
+}
+PACKED_POST uac3_ac_mu_desc_t;
+
+// Reference   : UAC 3.0 Specification
+// Table 4-28 : Connector Descriptor
+typedef PACKED struct uac3_ac_conn_desc
+{
+  uint16  wLength;              // 18 bytes
+  uint8   bDescriptorType;      // CS_INTERFACE
+  uint8   bDescriptorSubType;   // Connector Unit
+  uint16  wDescriptorID;
+  uint8   bNrConnectors;
+  uint8   baConID;              // Unique ID for connector
+  uint16  waClusterDescrID;     // ID of cluster descriptor
+  uint8   baConType;
+  uint8   bmaConAttributes;
+  uint16  waConDescrStr;
+  uint32  daConColor;
+}
+PACKED_POST uac3_ac_conn_desc_t;
+
+// Reference   : UAC 3.0 Specification
+// Table 4-46 : Power Domanin Descriptor (PDD)
+typedef PACKED struct uac3_ac_pd_desc
+{
+  uint8   bLength;              // 13 bytes
+  uint8   bDescriptorType;      // CS_INTERFACE
+  uint8   bDescriptorSubType;   // Connector Unit
+  uint8   bPowerDomainID;
+  uint16  waRecoveryTime1;      // Time to recover from D1 to D0. Expressed in terms of 50us.
+  uint16  waRecoveryTime2;      // Time to recover from D2 to D0. Expressed in terms of 50us.
+  uint8   bNrEntities;          // Number of entities belonging to this power domain. 
+  uint8   baEntryID1;           // ID of input terminal
+  uint8   baEntryID2;           // ID of output terminal
+  uint16  wPDomainDescrStr;     
+}
+PACKED_POST uac3_ac_pd_desc_t;
+
+// Reference    : UAC 3.0 Specification
+// Table 4 -49 : Class-Specific AS Interface Descriptor
+typedef PACKED struct uac3_as_ifc_desc
+{
+  uint8   bLength;              // 23 bytes
+  uint8   bDescriptorType;      // CS_INTERFACE
+  uint8   bDescriptorSubType;   // AS_GENERAL
+  uint8   bTerminalLink;        // Terminal ID of endpoint for the interface
+  uint32  bmControls;
+  uint16  wClusterID;
+  uint64  bmFormats;
+  uint8   bSubSlotSize;
+  uint8   bBitResolution;
+  uint16  bmAuxProtocol;
+  uint8   bControlSize;
+}
+PACKED_POST uac3_as_ifc_desc_t;
+
+// Reference    : UAC 3.0 Specification
+// Table 4 -50 : Class-Specific AS Valid Frequency  Range Descriptor
+typedef PACKED struct uac3_as_freq_range_desc
+{
+  uint8   bLength;              // 11 bytes
+  uint8   bDescriptorType;      // CS_INTERFACE
+  uint8   bDescriptorSubType;   // AS_GENERAL
+  uint32  dMin;                 // Minimum valid frequency
+  uint32  dMax;                 // Maximum valid frequency
+}
+PACKED_POST uac3_as_freq_range_desc_t;
+
+// Reference  : UAC 3.0 Specification
+// Table 4-34: Class-Specific AS Isochronous Audio Data Endpoint Descriptor
+typedef PACKED struct uac3_as_cs_data_ep_desc
+{
+  uint8   bLength;              // 8 bytes
+  uint8   bDescriptorType;      // CS_ENDPOINT
+  uint8   bDescriptorSubType;   // EP_GENERAL
+  uint32  bmControls;  
+  uint8   bLockDelayUnits;
+  uint16  wLockDelay;
+}
+PACKED_POST uac3_as_cs_data_ep_desc_t;
+
+typedef struct usb_fn_tbl_uac3
+{
+  uint8* (*uac30_ac_handle_get_req)(usb_audio_ctx_t* audio_ctx, uint8 ifc_num, uint8 unit_id, uint8 ch, uint8 control, uint8 req, uint32* len);
+  boolean (*uac30_ac_handle_set_req)(usb_audio_ctx_t* audio_ctx, uint8 ifc_num, uint8 unit_id, uint8 ch, uint8 control, uint8 req, uint32* buff, uint32 len);
+  uint8* (*uac30_as_handle_get_req)(usb_audio_stream_t* stream, uint8 ifc_num, uint8 recp, uint8 req, uint8 control, uint32* len);
+  boolean (*uac30_as_handle_set_req)(usb_audio_stream_t* stream, uint8 ifc_num, uint8 recp, uint8 req, uint8 control, uint32* buff, uint32 len);
+  uint8 (*badd3_get_bps)(usb_dcd_dsc_interface_t* ifc);
+  usb_dcd_dsc_interface_t* (*badd3_alloc_as_desc)(uint8** dsc, uint16* len, uint16 dsc_size, void* data, uint8 ifc_num, uint8* ep_in_num, uint8* ep_out_num);
+#ifdef USB_ENABLE_UAC30_FLAG
+  uint8 (*uac30_get_bps)(usb_dcd_dsc_interface_t* ifc);
+  uint16 (*uac30_alloc_as_cs_ep_desc)(uint8** dsc, uint16* len, uint16 dsc_size);
+  uint16 (*uac30_alloc_as_ifc_desc)(uint8** dsc, uint16* len, uint16 dsc_size, usb_audio_stream_t* stream, uint8 slot_size, uint8 bit_res, uint8 bm1, uint16* max_packet_size);
+  usb_dcd_dsc_interface_t* (*uac30_alloc_as_desc)(uint8** dsc, uint16* len, uint16 dsc_size, void* data, uint8 ifc_num, uint8* ep_in_num, uint8* ep_out_num);
+  void (*uac30_alloc_ac_pd_desc)(uint8** dsc, uint16* len, uint16 dsc_size, audio_pd_t* apd);
+  void (*uac30_alloc_ac_ot_desc)(uint8** dsc, uint16* len, uint16 dsc_size, audio_ot_t* aot, usb_audio_profile_t audio_profile);
+  void (*uac30_alloc_ac_mu_desc)(uint8** dsc, uint16* len, uint16 dsc_size, audio_mu_t* amu);
+  void (*uac30_alloc_ac_fu_desc)(uint8** dsc, uint16* len, uint16 dsc_size, audio_fu_t* afu);
+  void (*uac30_alloc_ac_cl_desc)(uint8** dsc, uint16* len, uint16 dsc_size, uint8 cl_id, uint8 n_ch);
+  void (*uac30_alloc_ac_conn_desc)(uint8** dsc, uint16* len, uint16 dsc_size, audio_conn_t* aconn);
+  void (*uac30_alloc_ac_it_desc)(uint8** dsc, uint16* len, uint16 dsc_size, audio_it_t* ait);
+  void (*uac30_alloc_ac_csel_desc)(uint8** dsc, uint16* len, uint16 dsc_size, usb_ifc_id ifc_id, uint8 source_id, uint8 term_id);
+  void (*uac30_alloc_ac_csrc_desc)(uint8** dsc, uint16* len, uint16 dsc_size, audio_cs_t* acs);
+  void (*uac30_alloc_ac_header_desc)(uint8** dsc, uint16* len, uint16 dsc_size, uint8 n_as, uint8 ifc_idx, uint8 fn_category);
+  uint16 (*uac30_alloc_ac_cs_desc)(uint8** dsc, uint16* len, uint16 dsc_size, usb_audio_ctx_t* audio_ctx, uint8 ifc_num, uint8 fn_category);
+  usb_dcd_dsc_interface_t* (*uac30_alloc_ac_desc)(uint8 ** dsc, uint16 * len, uint16 dsc_size, void* data, uint8 ifc_num, uint8* ep_in_num, uint8* ep_out_num);
+#endif
+  void (*uac30_alloc_ac_ifc_asoc_desc)(uint8** dsc, uint16* len, uint16 dsc_size, uint8 ifc_num, uint8 n_ifc, uint8 profile_id);
+  uint8 (*uac30_get_fn_category)(usb_audio_profile_t profile);
+  uint8 (*badd3_get_profile_id)(usb_audio_profile_t profile);
+  usb_dcd_dsc_interface_t* (*badd3_alloc_ac_desc)(uint8 ** dsc, uint16 * len, uint16 dsc_size, void* data, uint8 ifc_num, uint8* ep_in_num, uint8* ep_out_num);
+} usb_fn_tbl_uac3_t;
+
+extern usb_fn_tbl_uac3_t fn_tbl_uac3;
+
+#define usb_fn_uac3() (&fn_tbl_uac3)
+/*----------------------------------------------------------------------------
+ * Function Declarations and Documentation
+ * -------------------------------------------------------------------------*/
+
+#endif /* #ifndef USB_AUDIO_CLASS_30_H */
+

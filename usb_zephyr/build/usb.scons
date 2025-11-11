@@ -1,0 +1,150 @@
+#===============================================================================
+#
+# USB LIBS
+#
+# GENERAL DESCRIPTION
+#    build script
+#
+# Copyright (c) 2014-2018 by Qualcomm Technologies, Incorporated.
+# All Rights Reserved.
+# QUALCOMM Proprietary/GTDR
+#
+#-------------------------------------------------------------------------------
+#
+#  $Header: 
+#  $DateTime: 
+#  $Author: pwbldsvc $
+#  $Change: 
+#                      EDIT HISTORY FOR FILE
+#
+#  This section contains comments describing changes made to the module.
+#  Notice that changes are listed in reverse chronological order.
+#
+# when          who       what, where, why
+# ----------    ---       ---------------------------------------------------------
+# 01/04/2015    kameya    first draft
+#
+#===============================================================================
+Import('env')
+env = env.Clone()
+
+env.PrintInfo("In utils scons")
+#-------------------------------------------------------------------------------
+# Defines
+#-------------------------------------------------------------------------------
+
+#-------------------------------------------------------------------------------
+# Source PATH
+#-------------------------------------------------------------------------------
+
+SRCPATH = "../src"
+
+LIBNAME = 'usb'
+
+# Setup object file destination location.
+env.VariantDir('${BUILDPATH}', SRCPATH, duplicate=0)
+
+#-------------------------------------------------------------------------------
+# External depends within CoreBSP
+#-------------------------------------------------------------------------------
+USB_PUBLIC_APIS = [
+   'BUSES',
+   'SERVICES',
+   'DEBUGTOOLS',
+   'HAL',
+
+   'SYSTEMDRIVERS',
+   'WIREDCONNECTIVITY',
+
+   'KERNEL',
+   'QURT',
+]
+
+env.RequirePublicApi(USB_PUBLIC_APIS,area='core')
+
+env.RequirePublicApi('PLATFORM', area='platform')
+
+#-------------------------------------------------------------------------------
+# Internal depends within CoreBSP
+#-------------------------------------------------------------------------------
+env.Append(CPPDEFINES = [
+    #***usb log print min msg level {HIGH,MED,LOW}
+    'USB_FEATURE_ULOG',  #if def print usb_log to ulog else print to usb circular buffer
+
+    #***** compile individual usb log*
+    'USB_ENABLE_ERR_LOG', #For circular buffer, ERROR log must be enabled in order to enable other logs
+    'USB_ENABLE_GEN_LOG',
+    'USB_ENABLE_DBG_LOG',
+    'USB_ENABLE_ENG_LOG',
+
+    # Audio dependencies removed
+    'USB_HID_TEST',                   #Enable mock usb client HID test
+    'USB_HID_TEST_TX_CB',             #Enable mock usb client HID test with CB (every report reply with CB)
+    'USB_L1_ENABLE',                  #Enable USB L1
+    'USB_L2_ENABLE',                  #Enable USB L2
+    #'USB_HWIO_MEM_OPTIMIZE',         #Enable some protentional usb memory optimization(exclude log opt)
+    #'USB_KW_CONST_RESULT',           #Define to pass contant value, which will trigger KW error.
+    #'USB_FEATURE_ENABLE_MIPS_LOG',   #Enable Print MIPS count
+])
+
+
+
+env.PublishPrivateApi('USB_CLASSES', [
+   "${INC_ROOT}/core/wiredconnectivity/usb/src/dci/",
+   "${INC_ROOT}/core/wiredconnectivity/usb/src/dcd/",
+   "${INC_ROOT}/core/wiredconnectivity/usb/src/al/",
+   "${INC_ROOT}/core/wiredconnectivity/usb/src/func/",
+   "${INC_ROOT}/core/wiredconnectivity/usb/src/common/",
+])
+
+#-------------------------------------------------------------------------------
+# Source Code and LIBs
+#-------------------------------------------------------------------------------
+
+USB_COMMON_SOURCES = [
+    '${BUILDPATH}/common/usb_log.c',
+    '${BUILDPATH}/common/usb_mem_util.c',
+    '${BUILDPATH}/common/usb_util.c',
+]
+
+USB_DCI_SOURCES = [
+    '${BUILDPATH}/dci/usb_dci.c',
+    '${BUILDPATH}/dci/usb_dci_${MSM_ID}.c',
+    '${BUILDPATH}/dci/usb_dci_ulpi.c',
+]
+
+USB_DCD_SOURCES = [
+   '${BUILDPATH}/dcd/usb_dcd.c',
+   '${BUILDPATH}/dcd/usb_class_dcd.c',
+]
+
+USB_FD_SOURCES = [
+   '${BUILDPATH}/func/usb_fd.c',
+   '${BUILDPATH}/func/usb_bulk_fd.c',
+   '${BUILDPATH}/func/usb_hid_fd.c',
+   '${BUILDPATH}/func/usb_dfu_fd.c',
+   # Audio sources removed
+]
+
+USB_AL_SOURCES = [
+   '${BUILDPATH}/al/usb_al_hlos.c',
+   #'${BUILDPATH}/al/usb_audio_lb_client.c',
+   '${BUILDPATH}/dci/usb_isr.c',
+   '${BUILDPATH}/al/usb_log_api.c',
+]
+
+USB_SOURCES = [
+    USB_AL_SOURCES,
+    USB_FD_SOURCES,
+    USB_DCD_SOURCES,
+    USB_DCI_SOURCES,
+    USB_COMMON_SOURCES,
+]
+
+# Remove audio area dependency
+usb_hlos_lib = env.AddBinaryLibrary([], '${BUILDPATH}/'+LIBNAME, [USB_SOURCES])
+
+env.Print('----------return value of usb after usb-----in usb.scons-------------------------')
+print usb_hlos_lib
+
+env.LoadSoftwareUnits()

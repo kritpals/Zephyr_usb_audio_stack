@@ -1,0 +1,753 @@
+/*==================================================================*/
+/**
+  @file usb_audio_class_10.c
+
+  USB Audio Class 1.0 specification implementation
+
+  @file         usb_audio_class_10.c
+ 
+  @brief       Class specific descriptor generation
+  
+  @details    USB Audio Class 1.0 specification implementation
+
+                 Copyright (c) 2017 Qualcomm Technologies Inc.
+                 All Rights Reserved.
+                 Qualcomm Confidential and Proprietary
+*/
+/*==================================================================*/
+
+/*------------------------------------------------------------------------------------------
+ * Include Files
+ * ----------------------------------------------------------------------------------------*/
+#include <stringl/stringl.h>
+
+#include "usb_log.h"
+#include "usb_common.h"
+#include "usb_dcd.h"
+#include "usb_util.h"
+#include "usb_fd.h"
+#include "usb_audio_fd.h"
+#include "usb_audio_class_10.h"
+
+
+/*------------------------------------------------------------------------------------------
+ * Preprocessor Definitions and Constants
+ * ----------------------------------------------------------------------------------------*/
+#define UAC10_MAX_TRANSFER_SIZE                 (1023)
+#define UAC10_FEEDBACK_EP_INTERVAL_US           (1000)
+#define UAC10_BINTERVAL_US                      (1000)
+
+// bRequest values for Audio Control Class Specific Requests
+#define UAC10_REQ_UNDEFINED                     (0x00)
+#define UAC10_REQ_SET_CUR                       (0x01)
+#define UAC10_REQ_GET_CUR                       (0x81)
+#define UAC10_REQ_SET_MIN                       (0x02)
+#define UAC10_REQ_GET_MIN                       (0x82)
+#define UAC10_REQ_SET_MAX                       (0x03)
+#define UAC10_REQ_GET_MAX                       (0x83)
+#define UAC10_REQ_SET_RES                       (0x04)
+#define UAC10_REQ_GET_RES                       (0x84)
+#define UAC10_REQ_SET_MEM                       (0x05)
+#define UAC10_REQ_GET_MEM                       (0x85)
+#define UAC10_REQ_GET_STAT                      (0xFF)
+
+// Section A.10.5 - Audio 1.0 spec
+// Endpoint Control Selectors
+#define UAC10_EP_CONTROL_UNDEFINED              (0x00)
+#define UAC10_EP_CONTROL_SAMPLING_FREQ          (0x01)
+#define UAC10_EP_CONTROL_PITCH                  (0x02)
+
+// Reference: UAC1.0 - Section A.10.2 - Feature Unit Control Selectors
+// bmaControls
+#define UAC10_FU_MUTE_POS                       (0)
+#define UAC10_FU_VOLUME_POS                     (1)
+#define UAC10_FU_BASS_POS                       (2)
+#define UAC10_FU_MID_POS                        (3)
+#define UAC10_FU_TREBLE_POS                     (4)
+#define UAC10_FU_GR_EQUL_POS                    (5)
+#define UAC10_FU_AUTO_GAIN_POS                  (6)
+#define UAC10_FU_DELAY_POS                      (7)
+#define UAC10_FU_BASSBOOST_POS                  (8)
+#define UAC10_FU_LOUDNESS_POS                   (9)
+
+// Reference: UAC1.0 - Section 3.7.2.3 - Audio Channel Cluster Format
+// wChannelConfig
+#define UAC10_CH_CONFIG_LF_POS                  (0)   // left
+#define UAC10_CH_CONFIG_RF_POS                  (1)   // right
+#define UAC10_CH_CONFIG_CF_POS                  (2)   // center
+#define UAC10_CH_CONFIG_LFE_POS                 (3)   // low freq enhancement
+#define UAC10_CH_CONFIG_LS_POS                  (4)   // left surround
+#define UAC10_CH_CONFIG_RS_POS                  (5)   // rigt surround
+#define UAC10_CH_CONFIG_LC_POS                  (6)   // left of center
+#define UAC10_CH_CONFIG_RC_POS                  (7)   // rigt of center
+#define UAC10_CH_CONFIG_S_POS                   (8)   // surround
+#define UAC10_CH_CONFIG_SL_POS                  (9)   // side left
+#define UAC10_CH_CONFIG_SR_POS                  (10)  // side rigt
+#define UAC10_CH_CONFIG_T_POS                   (11)  // top
+
+#define UAC10_TYPE1_DATA_FORMAT_PCM             (1)
+#define UAC10_TYPE1_DATA_FORMAT_PCM8            (2)
+#define UAC10_TYPE1_DATA_FORMAT_IEEE_FLOAT      (3)
+
+// Feature unit bmaControls
+#define UAC10_FU_CONTROL_NONE                   (0x0)
+#define UAC10_FU_CONTROL_MUTE                   (1 << UAC10_FU_MUTE_POS)
+#define UAC10_FU_CONTROL_VOLUME                 (1 << UAC10_FU_VOLUME_POS)
+
+// Input terminal wChannelConfig
+#define UAC10_CH_COFIG_MONO                     (0x0)
+#define UAC10_CH_COFIG_STEREO                   ((1 << UAC10_CH_CONFIG_LF_POS) | (1 << UAC10_CH_CONFIG_RF_POS))
+
+/*------------------------------------------------------------------------------------------     
+* Type Declarations     
+* ----------------------------------------------------------------------------------------*/ 
+
+/*------------------------------------------------------------------------------------------
+ * Function Declarations and Definitions
+ * ---------------------------------------------------------------------------------------*/
+
+uint8 uac10_get_bref_from_us(uint16 bint_us)
+{
+  uint8 i = 0;
+  uint16 usb_frame_us = 1000;
+
+  if (bint_us < usb_frame_us || (bint_us%usb_frame_us != 0))
+  {
+    return 0;
+  }
+
+  for(i=0; bint_us != (usb_frame_us << i); i++);
+  return i;
+}
+
+uint8* uac10_ac_handle_get_req(usb_audio_ctx_t* audio_ctx, uint8 ifc_num, uint8 unit_id, 
+  uint8 ch, uint8 control, uint8 req, uint32* len)
+{
+  audio_node_t* node = NULL;
+
+  node = usb_fn_fd_audio()->usb_audio_get_node(audio_ctx, unit_id);
+  USB_ERR_HALT(node);
+  
+  if(node && node->val.type == AUDIO_FEATURE_UNIT)
+  {
+    switch(control)
+    {
+      case UAC10_FU_CONTROL_MUTE:
+      {
+        if(req == UAC10_REQ_GET_CUR)
+        {         
+          if(TRUE == audio_ctx->get_req(ifc_num, node, AUDIO_CTRL_FU_MUTE, AUDIO_REQ_CURR, 
+            (audio_ch_t)ch, (uint32*)audio_ctx->dsc_buff, len))
+          {
+            return audio_ctx->dsc_buff;
+          }
+        }
+      }
+      break;
+    
+      case UAC10_FU_CONTROL_VOLUME:
+      {
+        switch (req)
+        {
+          case UAC10_REQ_GET_CUR:
+          {
+            if(TRUE == audio_ctx->get_req(ifc_num, node, AUDIO_CTRL_FU_VOLUME, AUDIO_REQ_CURR, 
+              (audio_ch_t)ch, (uint32*)audio_ctx->dsc_buff, len))
+            {
+              return audio_ctx->dsc_buff;
+            }
+          }
+          break;
+
+          case UAC10_REQ_GET_MIN:
+          {
+            if(TRUE == audio_ctx->get_req(ifc_num, node, AUDIO_CTRL_FU_VOLUME, AUDIO_REQ_MIN, 
+              (audio_ch_t)ch, (uint32*)audio_ctx->dsc_buff, len))
+            {
+              return audio_ctx->dsc_buff;
+            }
+          }
+          break;
+
+          case UAC10_REQ_GET_MAX:
+          {
+            if(TRUE == audio_ctx->get_req(ifc_num, node, AUDIO_CTRL_FU_VOLUME, AUDIO_REQ_MAX, 
+              (audio_ch_t)ch, (uint32*)audio_ctx->dsc_buff, len))
+            {
+              return audio_ctx->dsc_buff;
+            }
+          }
+          break;
+
+
+          case UAC10_REQ_GET_RES:
+          {
+            if(TRUE == audio_ctx->get_req(ifc_num, node, AUDIO_CTRL_FU_VOLUME, AUDIO_REQ_RES, 
+              (audio_ch_t)ch, (uint32*)audio_ctx->dsc_buff, len))
+            {
+              return audio_ctx->dsc_buff;
+            }
+          }
+          break;
+        }
+      }
+      break;
+    
+      default:
+        USB_ULOG(BAM_QLOG, "unknown control");
+    }
+  }
+
+  return NULL;
+}
+
+boolean uac10_ac_handle_set_req(usb_audio_ctx_t* audio_ctx, uint8 ifc_num, uint8 unit_id, 
+  uint8 ch, uint8 control, uint8 req, uint32* buff, uint32 len)
+{
+  audio_node_t* node = NULL;
+
+  node = usb_fn_fd_audio()->usb_audio_get_node(audio_ctx, unit_id);
+  USB_ERR_HALT(node);
+
+  if(node && node->val.type == AUDIO_FEATURE_UNIT)
+  {
+    switch(control)
+    {
+      case UAC10_FU_CONTROL_MUTE:
+      {
+        if(req == UAC10_REQ_SET_CUR)
+        {         
+          USB_ULOG_1(BAM_QLOG, "mute control SET_CURR, fu_id %d", unit_id);
+          return audio_ctx->set_req(ifc_num, node, AUDIO_CTRL_FU_MUTE, AUDIO_REQ_CURR, 
+            (audio_ch_t)ch, buff, len);
+        }
+      }
+      break;
+    
+      case UAC10_FU_CONTROL_VOLUME:
+      {
+        switch (req)
+        {
+          case UAC10_REQ_SET_CUR:
+            USB_ULOG_1(BAM_QLOG, "volume control SET_CURR, fu_id %d", unit_id);
+            return audio_ctx->set_req(ifc_num, node, AUDIO_CTRL_FU_VOLUME, AUDIO_REQ_CURR, 
+              (audio_ch_t)ch, buff, len);
+        }
+      }
+      break;
+    
+      default:
+        USB_ULOG(BAM_QLOG, "unknown control");
+    }
+  }
+  return FALSE;
+}
+
+uint8* uac10_as_handle_get_req(usb_audio_stream_t* stream, uint8 ifc_num, uint8 recp, 
+  uint8 req, uint8 control, uint32* len)
+{
+  if(recp == USB_SETUP_RT_RCP_EP)
+  {
+    switch(control)
+    {
+      case UAC10_EP_CONTROL_SAMPLING_FREQ:
+        (*len) = 3;
+        USB_ULOG_1(BAM_QLOG, "sampling freq GET_CURR, fu_id %d", stream->cs->id);
+        return (uint8*) &stream->cs->controls_ptr->freq;
+    }
+  }
+  return NULL;
+}
+
+boolean uac10_as_handle_set_req(usb_audio_stream_t* stream, uint8 ifc_num, 
+  uint8 recp, uint8 req, uint8 control, uint32* buff, uint32 len)
+{
+  if(recp == USB_SETUP_RT_RCP_EP)
+  {
+    switch(control)
+    {
+      case UAC10_EP_CONTROL_SAMPLING_FREQ:
+        USB_ULOG_1(BAM_QLOG, "sampling freq SET_CURR, fu_id %d", stream->cs->id);
+        stream->cs->controls_ptr->freq = *((uint32 *) buff);
+        return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+uint8 uac10_get_bps(usb_dcd_dsc_interface_t* ifc)
+{
+  uac1_as_ifc_type1_desc_t* as_ifc_type1;
+  as_ifc_type1= (uac1_as_ifc_type1_desc_t* ) ((uint8*) ifc->cs_dsc + sizeof(uac1_as_ifc_desc_t));
+  return as_ifc_type1->bSubframeSize;
+}
+
+uint16 uac10_alloc_as_cs_ep_desc(uint8** dsc, uint16* len, uint16 dsc_size)
+{
+  uac1_as_cs_data_ep_desc_t* as_cs_data_ep = (uac1_as_cs_data_ep_desc_t*) (*dsc);
+  (*len) += sizeof(uac1_as_cs_data_ep_desc_t);
+  USB_ASSERT(as_cs_data_ep && ((*len) < dsc_size));
+  as_cs_data_ep->bLength            = sizeof(uac1_as_cs_data_ep_desc_t);
+  as_cs_data_ep->bDescriptorType    = USB_AUDIO_CS_EP_DESC_TYPE;
+  as_cs_data_ep->bDescriptorSubType = USB_AUDIO_CS_EP_DESC_SUBTYPE_GENERAL;
+  as_cs_data_ep->bmAttributes       = 0x01; // SamplingFrequency control
+  as_cs_data_ep->bLockDelayUnits    = 0x02; // Decoded PCM samples
+  as_cs_data_ep->wLockDelay         = 0x00; // Endpoint takes n samples to lock internal recovery clock.
+  (*dsc) += sizeof(uac1_as_cs_data_ep_desc_t);
+  return sizeof(uac1_as_cs_data_ep_desc_t);
+}
+
+usb_dcd_dsc_endpoint_t* uac10_alloc_as_ep_desc(uint8** dsc, uint16* len, uint16 dsc_size, 
+uint8 ep_num, uint8 ep_mask, uint8 ep_attr, uint8 ep_interval, uint16 max_packet_size, 
+  uint8 b_refresh, uint8 sync_addr)
+{
+  usb_dcd_dsc_endpoint_t* ep_ptr;
+  uac1_as_std_data_ep_desc_t* ep = (uac1_as_std_data_ep_desc_t*) (*dsc);
+
+  USB_ASSERT(ep);
+  USB_ASSERT(ep_ptr = (usb_dcd_dsc_endpoint_t*)usb_fn_mem_util()->usb_malloc(sizeof(usb_dcd_dsc_endpoint_t)));
+
+  (*len) += sizeof(uac1_as_std_data_ep_desc_t);
+  USB_ASSERT((*len) < dsc_size);
+  ep->bLength            = sizeof(uac1_as_std_data_ep_desc_t);
+  ep->bDescriptorType    = USB_DESCTYPE_ENDPOINT;
+  ep->wMaxPacketSize     = max_packet_size;
+  ep->bEndpointAddress   = ep_num | ep_mask;
+  ep->bmAttributes       = ep_attr;
+  ep->bInterval          = ep_interval;
+  ep->bRefresh           = b_refresh;
+  ep->bSynchAddress      = (sync_addr) ?  (sync_addr | USB_EP_ADDR_IN) : sync_addr;
+  ep_ptr->descriptor     = (usb_desc_endpoint_t*)ep;
+  (*dsc) += sizeof(uac1_as_std_data_ep_desc_t);
+  return ep_ptr;
+}
+
+uint16 uac10_alloc_as_ifc_desc(uint8** dsc, uint16* len, uint16 dsc_size, 
+  usb_audio_stream_t* stream, uint8 frame_size, uint8 bit_res, uint8 bm1, uint32* freq_arr, 
+  uint16 freq_arr_size)
+{
+  uac1_as_ifc_desc_t* as_ifc;
+  uac1_as_ifc_type1_desc_t* as_ifc_type1;
+  uint32 cs_offset = (*len);
+  uint8 i;
+  uint8* as_dsc = (*dsc);
+  uint16 max_packet_size;
+
+  (*len) += sizeof(uac1_as_ifc_desc_t);
+  USB_ASSERT((*len) < dsc_size);
+  as_ifc = (uac1_as_ifc_desc_t* )as_dsc;
+  as_ifc->bLength             = sizeof(uac1_as_ifc_desc_t);
+  as_ifc->bDescriptorType     = USB_AUDIO_CS_DESC_TYPE;
+  as_ifc->bDescriptorSubType  = USB_AUDIO_CS_IFC_DESC_SUBTYPE_GENERAL;
+  as_ifc->bTerminalLink       = 0x0; 
+  as_ifc->bTerminalLink       = stream->term->val.id; 
+  as_ifc->bDelay              = 0x1;               
+  as_ifc->wFormatTag          = UAC10_TYPE1_DATA_FORMAT_PCM;
+  as_dsc += sizeof(uac1_as_ifc_desc_t);
+
+  // Allocate type 1 format desc
+  (*len) += sizeof(uac1_as_ifc_type1_desc_t);
+  USB_ASSERT((*len) < dsc_size);
+
+  as_ifc_type1 = (uac1_as_ifc_type1_desc_t *) as_dsc;
+  as_ifc_type1->bLength             = sizeof(uac1_as_ifc_type1_desc_t);  
+  as_ifc_type1->bDescriptorType     = USB_AUDIO_CS_DESC_TYPE;
+  as_ifc_type1->bDescriptorSubType  = USB_AUDIO_CS_IFC_DESC_SUBTYPE_FORMAT;
+  as_ifc_type1->bFormatType         = USB_AUDIO_CS_IFC_DESC_FORMAT_TYPE_1;
+  as_ifc_type1->bNrChannels         = stream->cfg.n_ch;
+  as_ifc_type1->bSubframeSize       = frame_size;
+  as_ifc_type1->bBitResolution      = bit_res;
+  as_ifc_type1->bSamFreqType        = 0;
+  as_dsc += sizeof(uac1_as_ifc_type1_desc_t);
+
+  for(i=0; i < freq_arr_size; i++)
+  {
+    max_packet_size = usb_fn_fd_audio()->usb_audio_calc_transfer_size(freq_arr[i], stream->cfg.n_ch,
+      frame_size, bm1, stream->usb_frame_us);
+
+    if (max_packet_size <= UAC10_MAX_TRANSFER_SIZE)
+    {
+      (*len) += 3;
+      USB_ASSERT((*len) < dsc_size);
+      as_ifc_type1->bSamFreqType++;
+      as_ifc_type1->bLength += 3;
+      as_dsc[0] = (freq_arr[i] & 0xFF);
+      as_dsc[1] = ((freq_arr[i] >> 8) & 0xFF);
+      as_dsc[2] = ((freq_arr[i] >> 16) & 0xFF);
+      as_dsc += 3;
+    }
+  }
+
+  (*dsc) = as_dsc;
+  return ((*len) - cs_offset);
+}
+
+usb_dcd_dsc_interface_t* uac10_alloc_as_desc(uint8** dsc, uint16* len, 
+  uint16 dsc_size, void* data, uint8 ifc_num, uint8* ep_in_num, uint8* ep_out_num)
+{
+  uint8 n_ep;
+  uint8 alt_set;
+  uint8 frame_size;
+  uint8 bit_res;
+  uint8 i;
+  uint8 j;
+  usb_dcd_dsc_interface_t* ifc;
+  usb_dcd_dsc_interface_t* ifc_itr;
+  usb_dcd_dsc_endpoint_t* ep_itr;
+  usb_dcd_dsc_endpoint_t* fb_ep_itr;
+  uint8 bm1 = 0; 
+  uint8 ep_num = 0;
+  uint8 ep_mask = 0;
+  uint8 ep_attr = 0;
+  uint16 max_packet_size = USB_AUDIO_MAX_TRANSFER_SIZE;
+  boolean expl_fb_ep = FALSE;
+  uint8 fb_ep_attr = 0;
+  uint8 fb_ep_num = 0;
+  uint8 fb_bref = 0;
+  uint8 fb_size = 0;
+  usb_audio_stream_t* stream = (usb_audio_stream_t* )data;
+
+  USB_ASSERT(stream);
+
+  switch(stream->ifc_id)
+  {
+    case USB_IFC_ID_AUDIO_STREAMING_MIC:
+    {
+      ep_num = ++(*ep_in_num);
+      ep_mask = USB_EP_ADDR_IN;
+      ep_attr = USB_EP_ATTR_ISOCH | USB_EP_ATTR_SYNC_ASYNC;
+    }
+    break;
+ 
+    case USB_IFC_ID_AUDIO_STREAMING_SPEAKER:
+    {
+      ep_num = ++(*ep_out_num);
+      ep_mask = USB_EP_ADDR_OUT;
+      ep_attr = USB_EP_ATTR_ISOCH | USB_EP_ATTR_SYNC_ASYNC;
+
+#ifdef USB_AUDIO_EXPL_ASYNC_FEEDBACK
+      // Explicit ASYNC feedback endpoint
+      expl_fb_ep = TRUE;
+      fb_ep_num  = ++(*ep_in_num);
+      fb_ep_attr = USB_EP_ATTR_ISOCH | USB_EP_ATTR_SYNC_NONE;
+      fb_size = USB_AUDIO_FB_FREQ_SIZE_FS;
+#endif
+    }
+    break;
+
+    default:  
+      USB_ERR_FATAL("Unknown stream type", stream->ifc_id, 0, 0);
+  }
+ 
+  // Allocate default interface alt_set(0).
+  n_ep = 0;
+  alt_set = 0;
+  ifc = usb_fn_fd()->usb_fd_alloc_ifc_desc(dsc, len, dsc_size, ifc_num, alt_set, n_ep, USB_INTERFACE_CLASS_AUDIO, 
+    USB_INTERFACE_AUDIO_SUBCLASS_STREAMING, USB_INTERFACE_PROTOCOL_NONE, USB_INTERFACE_STR_INDEX_NONE);
+  ifc->id = stream->ifc_id;
+  ifc->setup = usb_fn_fd_audio()->usb_audio_stream_set_ifc;
+   
+  // Allocate alt_set(n)
+  for(i=0; i < stream->slot_arr_size; i++)
+  {
+    frame_size = stream->slot_arr[i].slot_size;
+    bit_res = stream->slot_arr[i].bit_res;
+    alt_set = i+1;
+    n_ep = expl_fb_ep ? 2 : 1;
+    // Hardcode bInterval_us to 1000 as it is the only valid value in UAC 1.0.
+    bm1 = usb_fn_fd_audio()->usb_audio_get_bm1_from_us(UAC10_BINTERVAL_US, stream->usb_frame_us);
+    ifc_itr = usb_fn_fd()->usb_fd_alloc_ifc_desc(dsc, len, dsc_size, ifc_num, alt_set, n_ep, USB_INTERFACE_CLASS_AUDIO, 
+      USB_INTERFACE_AUDIO_SUBCLASS_STREAMING, USB_INTERFACE_PROTOCOL_NONE, USB_INTERFACE_STR_INDEX_NONE);
+    INSERT_TAIL(usb_dcd_dsc_interface, ifc, ifc_itr);
+    ifc_itr->setup = usb_fn_fd_audio()->usb_audio_stream_set_ifc;
+    ifc_itr->id = stream->ifc_id;
+    ifc_itr->cs_dsc = (*dsc);
+    ifc_itr->cs_dsc_size = usb_fn_uac1()->uac10_alloc_as_ifc_desc(dsc, len, dsc_size, stream, frame_size, 
+      bit_res, bm1, stream->freq_arr, stream->freq_arr_size);
+
+    for(j=stream->freq_arr_size; j; j--)
+    {
+      max_packet_size = usb_fn_fd_audio()->usb_audio_calc_transfer_size(stream->freq_arr[j-1], stream->cfg.n_ch,
+        frame_size, bm1, stream->usb_frame_us);
+      if(max_packet_size <= USB_AUDIO_MAX_TRANSFER_SIZE)
+      {
+        break;
+      }
+    }
+
+    // Allocate ISOC data endpoint descriptor
+    ep_itr = usb_fn_uac1()->uac10_alloc_as_ep_desc(dsc, len, dsc_size, ep_num, ep_mask, ep_attr, 
+      (bm1+1), max_packet_size, 0, fb_ep_num);
+    INSERT_TAIL(usb_dcd_dsc_endpoint, ifc_itr->endpoints, ep_itr);
+    ep_itr->setup = usb_fn_fd_audio()->usb_audio_start_session;
+    ep_itr->ifc = ifc_itr;
+    ep_itr->cs_dsc = (*dsc);
+    ep_itr->cs_dsc_size = usb_fn_uac1()->uac10_alloc_as_cs_ep_desc(dsc, len, dsc_size);
+
+    // Allocate explicit ASYNC feedback endpoint descriptor
+    if (expl_fb_ep) 
+    {
+      uac1_as_std_data_ep_desc_t* ep = (uac1_as_std_data_ep_desc_t*)(*dsc);
+      fb_bref = usb_fn_uac1()->uac10_get_bref_from_us(UAC10_FEEDBACK_EP_INTERVAL_US);
+      fb_ep_itr = usb_fn_uac1()->uac10_alloc_as_ep_desc(dsc, len, dsc_size, fb_ep_num, USB_EP_ADDR_IN, fb_ep_attr, 
+        (bm1+1), fb_size, fb_bref, 0);
+      fb_ep_itr->cs_dsc = &(ep->bRefresh);
+      fb_ep_itr->cs_dsc_size = 1;
+      INSERT_TAIL(usb_dcd_dsc_endpoint, ifc_itr->endpoints, fb_ep_itr);
+      fb_ep_itr->setup = usb_fn_fd_audio()->usb_audio_start_expl_fb;
+      fb_ep_itr->ifc = ifc_itr;
+    }
+  }
+
+  return ifc;
+}
+
+void uac10_alloc_ac_ot_desc(uint8** dsc, uint16* len, uint16 dsc_size, audio_ot_t* aot, 
+  usb_audio_profile_t audio_profile)
+{
+  uac1_ot_desc_t* ot = (uac1_ot_desc_t*) (*dsc);
+
+  (*len) += sizeof(uac1_ot_desc_t);
+  USB_ASSERT((*len) < dsc_size);
+  ot->bLength              = sizeof(uac1_ot_desc_t);       // 9 bytes
+  ot->bDescriptorType      = USB_AUDIO_CS_DESC_TYPE;       // CS_INTERFACE
+  ot->bDescriptorSubType   = USB_AUDIO_CS_DESC_SUBTYPE_OT; // OUTPUT_TERMINAL           
+  ot->bTerminalID          = aot->id;
+  ot->wTerminalType        = USB_AUDIO_TERM_TYPE_STREAMING;
+  ot->bAssocTerminal       = 0x00;
+  ot->bSourceID            = aot->source_id;
+  ot->iTerminal            = 0x00; 
+ 
+  if(aot->term_type == AUDIO_TERMINAL_SPEAKER)
+  {
+    ot->wTerminalType = usb_fn_fd_audio()->usb_audio_get_ot_type(audio_profile);
+  }
+
+  (*dsc) += sizeof(uac1_ot_desc_t);
+}
+
+void uac10_alloc_ac_mu_desc(uint8** dsc, uint16* len, uint16 dsc_size, audio_mu_t* amu)
+{
+  uac1_ac_mu_desc_t* mu = (uac1_ac_mu_desc_t*) (*dsc);
+  (*len) += sizeof(uac1_ac_mu_desc_t);
+  USB_ASSERT((*len) < dsc_size);
+  mu->bLength             = sizeof(uac1_ac_mu_desc_t);    // 13
+  mu->bDescriptorType     = USB_AUDIO_CS_DESC_TYPE;       // CS_INTERFACE
+  mu->bDescriptorSubType  = USB_AUDIO_CS_DESC_SUBTYPE_MU; // MIXER_UNIT
+  mu->bUnitID             = amu->id;
+  mu->bNrInPins           = amu->n_sources;
+  mu->baSourceID1         = amu->source_id[0];
+  mu->baSourceID2         = amu->source_id[1];
+  mu->bNrChannels         = amu->n_op_ch;
+  mu->wChannelConfig      = UAC10_CH_COFIG_MONO;
+  mu->iChannelNames       = 0x00;
+  mu->bmControls          = 0x00;
+  mu->iMixer              = 0x00;
+
+  if (mu->bNrChannels == 2) // stereo
+  {
+    mu->wChannelConfig = UAC10_CH_COFIG_STEREO;
+  }
+
+  (*dsc) += sizeof(uac1_ac_mu_desc_t);
+}
+
+void uac10_alloc_ac_fu_desc(uint8** dsc, uint16* len, uint16 dsc_size, audio_fu_t* afu)
+{
+  uint8* ac_dsc = (*dsc);
+  uac1_fu_desc_t* fu =(uac1_fu_desc_t*) ac_dsc;
+  uint8 i;
+  uint8 bLength = sizeof(uac1_fu_desc_t) + (afu->n_ch * sizeof(uac1_fu_bma_controls_t)) + 1; // +1 for iFeature
+
+  (*len) += bLength;
+  USB_ASSERT((*len) < dsc_size);
+
+  fu->bDescriptorType       = USB_AUDIO_CS_DESC_TYPE;         // CS_INTERFACE
+  fu->bDescriptorSubType    = USB_AUDIO_CS_DESC_SUBTYPE_FU;   // FEATURE_UNIT
+  fu->bSourceID             = afu->source_id;                      // Source is input terminal
+  fu->bUnitID               = afu->id;
+  fu->bControlSize          = sizeof(uac1_fu_bma_controls_t); // size of bmaControls() array : n
+  fu->bLength               = bLength;
+  fu->bmaControls0          = 0; 
+  ac_dsc += sizeof(uac1_fu_desc_t);
+
+  // Master channel controls
+  if(afu->controls & AUDIO_CTRL_FU_MUTE)
+  {
+    fu->bmaControls0 |= UAC10_FU_CONTROL_MUTE;
+  }
+
+  if(afu->controls & AUDIO_CTRL_FU_VOLUME)
+  {
+    fu->bmaControls0 |= UAC10_FU_CONTROL_VOLUME;
+  }
+
+  // Populate controls for logical channels.
+  // Advertise same controls as master channel on logical channels.
+  // bmaControls(n)
+  for(i=0; i < afu->n_ch; i++)
+  {
+    // compiler cannot resolve unaligned word writes.
+    ac_dsc[0] = (fu->bmaControls0 & 0xFF);
+    ac_dsc[1] = 0;
+    ac_dsc += sizeof(uint16);
+  }
+
+  // Assign uint8 iFeature
+  ac_dsc[0] = 0x0;
+  ac_dsc++; //sizeof(uint8);
+
+  (*dsc) = ac_dsc;
+}
+ 
+void uac10_alloc_ac_it_desc(uint8** dsc, uint16* len, uint16 dsc_size, audio_it_t* ait)
+{
+  uac1_it_desc_t* it       = (uac1_it_desc_t *)(*dsc);
+
+  (*len) += sizeof(uac1_it_desc_t);
+  USB_ASSERT((*len) < dsc_size);
+  it->bLength              = sizeof(uac1_it_desc_t);       // 12 bytes
+  it->bDescriptorType      = USB_AUDIO_CS_DESC_TYPE;       // CS_INTERFACE
+  it->bDescriptorSubType   = USB_AUDIO_CS_DESC_SUBTYPE_IT; // INPUT_TERMINAL           
+  it->bTerminalID          = ait->id;
+  it->wTerminalType        = USB_AUDIO_TERM_TYPE_STREAMING; // default
+  it->bAssocTerminal       = 0x00;
+  it->bNrChannels          = ait->n_ch;
+  it->wChannelConfig       = UAC10_CH_COFIG_MONO;           // default
+  it->iChannelNames        = 0x00;
+  it->iTerminal            = 0x00;
+
+  if(ait->term_type == AUDIO_TERMINAL_MIC)
+  {
+    it->wTerminalType = USB_AUDIO_TERM_TYPE_IT_MIC;    
+  }
+
+  if(it->bNrChannels == 2)// stereo
+  {
+    it->wChannelConfig = UAC10_CH_COFIG_STEREO;
+  }
+
+  (*dsc) += sizeof(uac1_it_desc_t);
+}
+ 
+void uac10_alloc_ac_header_desc(uint8** dsc, uint16* len, uint16 dsc_size, uint8 n_as, uint8 ifc_idx)
+{
+  uint8 i;
+  uint8* ac_dsc = (*dsc);
+  uac1_cs_ac_header_desc_t* ac_header = (uac1_cs_ac_header_desc_t *) ac_dsc;
+  (*len) += sizeof(uac1_cs_ac_header_desc_t) + (sizeof(uint8) * n_as);
+  USB_ASSERT((*len) < dsc_size);
+  ac_header->bLength            = sizeof(uac1_cs_ac_header_desc_t) + n_as;
+  ac_header->bDescriptorType    = USB_AUDIO_CS_DESC_TYPE;  // CS_INTERFACE
+  ac_header->bDescriptorSubType = USB_AUDIO_CS_DESC_SUBTYPE_HEADER;           
+  ac_header->bcdADC             = USB_AUDIO_CLASS_REV_1;
+  ac_header->wTotalLength       = 0; // fill later when all interfaces are allocated.
+  ac_header->bInCollection      = n_as;  
+  ac_dsc += sizeof(uac1_cs_ac_header_desc_t);
+  
+  // Allocate uint8 baInterfaceNr(n)
+  for(i=0; i < n_as; i++)
+  {
+    ac_dsc[i] = (i+ifc_idx+1); // ifc_idx is first audio streaming interface in this collection.
+  }
+  ac_dsc += n_as;
+  (*dsc) = ac_dsc;
+}
+
+uint16 uac10_alloc_ac_cs_desc(uint8** dsc, uint16* len, uint16 dsc_size, 
+  usb_audio_ctx_t* audio_ctx, uint8 ifc_num)
+{
+  uint8 i;
+  uac1_cs_ac_header_desc_t* ac_header;
+  uint32 uac_offset = (*len);
+
+  // Allocate class speficic header
+  ac_header = (uac1_cs_ac_header_desc_t *) (*dsc);
+  usb_fn_uac1()->uac10_alloc_ac_header_desc(dsc, len, dsc_size, audio_ctx->n_ifc, ifc_num);
+  
+  for(i = 0; i < audio_ctx->n_nodes; i++)
+  {
+    audio_node_t* node = &audio_ctx->topology[i];
+    switch(node->val.type)
+    {
+      case AUDIO_INPUT_TERMINAL:
+      {
+        usb_fn_uac1()->uac10_alloc_ac_it_desc(dsc, len, dsc_size, (audio_it_t*) node);
+      }
+      break;
+
+      case AUDIO_FEATURE_UNIT:
+      {
+        usb_fn_uac1()->uac10_alloc_ac_fu_desc(dsc, len, dsc_size, (audio_fu_t*) node);
+      }
+      break;
+
+      case AUDIO_MIXER_UNIT:
+      {
+        usb_fn_uac1()->uac10_alloc_ac_mu_desc(dsc, len, dsc_size, (audio_mu_t*) node);
+      }
+      break;
+
+      case AUDIO_OUTPUT_TERMINAL:
+      {
+        usb_fn_uac1()->uac10_alloc_ac_ot_desc(dsc, len, dsc_size, (audio_ot_t*)node, audio_ctx->profile);
+      }
+      break;
+
+      default:
+        USB_ULOG_1(DBG_E_QLOG, "unknwon node type %d", node->val.type);
+        USB_LOG_ERR_1(log_uac10_alloc_ac_cs_desc__unknown_node_D, (uint32)node->val.type);
+        break;
+    }
+  }
+
+  ac_header->wTotalLength = (*len) - uac_offset;
+  return ((*len) - uac_offset);
+}
+
+usb_dcd_dsc_interface_t* uac10_alloc_ac_desc(uint8 ** dsc, uint16 * len, 
+  uint16 dsc_size, void* data, uint8 ifc_num, uint8* ep_in_num, uint8* ep_out_num)
+{
+  uint8 n_ep = 0;
+  uint8 alt_set = 0;
+  usb_audio_ctx_t* audio_ctx = (usb_audio_ctx_t*) data;
+  usb_dcd_dsc_interface_t* ifc;
+
+  USB_ASSERT(audio_ctx);
+
+  // Allocate interface descriptor for AudioControl class
+  ifc = usb_fn_fd()->usb_fd_alloc_ifc_desc(dsc, len, dsc_size, ifc_num, alt_set, n_ep, 
+    USB_INTERFACE_CLASS_AUDIO, USB_INTERFACE_AUDIO_SUBCLASS_CONTROL, USB_INTERFACE_PROTOCOL_NONE, 
+    USB_INTERFACE_STR_INDEX_NONE);
+  ifc->id = audio_ctx->id;
+  ifc->cs_dsc = (*dsc);
+  ifc->cs_dsc_size = usb_fn_uac1()->uac10_alloc_ac_cs_desc(dsc, len, dsc_size, audio_ctx, ifc_num);
+  return ifc;
+}
+
+/*----------------------------------------------------------------------------
+ * Function table definitions - UAC1.0 FD layer
+ * -------------------------------------------------------------------------*/
+
+usb_fn_tbl_uac1_t fn_tbl_uac1 = 
+{
+  uac10_get_bref_from_us,
+  uac10_ac_handle_get_req,
+  uac10_ac_handle_set_req,
+  uac10_as_handle_get_req,
+  uac10_as_handle_set_req,
+  uac10_get_bps,
+  uac10_alloc_as_cs_ep_desc,
+  uac10_alloc_as_ep_desc,
+  uac10_alloc_as_ifc_desc,
+  uac10_alloc_as_desc,
+  uac10_alloc_ac_ot_desc,
+  uac10_alloc_ac_mu_desc,
+  uac10_alloc_ac_fu_desc,
+  uac10_alloc_ac_it_desc,
+  uac10_alloc_ac_header_desc,
+  uac10_alloc_ac_cs_desc,
+  uac10_alloc_ac_desc,
+};
+
+

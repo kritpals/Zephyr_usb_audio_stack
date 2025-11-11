@@ -1,0 +1,300 @@
+#ifndef USB_AL_HLOS_BULK_H
+#define USB_AL_HLOS_BULK_H
+/*=======================================================================*//**
+ * @file        usb_al_bulk.c
+ * @author:     dpatnaik
+ * @date        12-Feb-2011
+ *
+ * @brief       USB (Qualcomm High-Speed USB) AL (Adaptation-Layer) implementation.
+ *
+ * @details     This file contains the implementation of the APIs to be used by
+ *              the boot Sahara downloader.
+ *
+ * @note        
+ *
+ *              Copyright 2011 QUALCOMM Incorporated.
+ *              All Rights Reserved.
+ *              Qualcomm Confidential and Proprietary
+ * 
+*//*========================================================================*/
+
+
+// ===========================================================================
+// 
+//                            EDIT HISTORY FOR FILE
+//   This section contains comments describing changes made to the module.
+//   Notice that changes are listed in reverse chronological order.
+// 
+// $Header: //components/rel/audio.whs/1.0/mcu_proc/core/wiredconnectivity/usb/src/al/usb_al_hlos.h#1 $ 
+// $DateTime: 2018/02/12 17:09:34 $ $Author: pwbldsvc $
+// 
+// when       who     what, where, why
+// --------   ---     ----------------------------------------------------------
+// 02/12/11   dpatnaik  Initial revision
+//
+// ===========================================================================
+
+//----------------------------------------------------------------------------
+// Include Files
+//----------------------------------------------------------------------------
+#include "comdef.h"       // common defines - basic types as byte word uint32 etc
+#include "usb_common.h"   //speed defines
+#include "usb_hid_api.h"
+#include "usb_audio.h"
+#include "usb_dfu.h"
+
+typedef enum
+{
+  //last 32bit is used for iface signal
+  USB0_TASK_EVENT_QUEUE_SIG     = 0x00010000,
+  USB0_TASK_ENUM_DONE_SIG       = 0x00020000,
+  USB0_TASK_PWR_EVENT_QUEUE_SIG = 0x00040000,
+  USB0_TASK_VBUS_EVENT_SIG      = 0x00080000,
+  USB0_TASK_LOG_TIMER_EXP_SIG   = 0x00100000,
+} usb0_signal_type;
+
+//----------------------------------------------------------------------------
+// Function Declarations and Documentation
+//----------------------------------------------------------------------------
+boolean usb_ctrl_out_cb(uint8* setup_ptr, uint8* payload, uint32 payload_size);
+boolean usb_ctrl_in_cb(uint8* setup_ptr, uint8* payload, uint32* payload_size);
+
+void usb_register_ctrl_client(ctrl_client_ctx_t* ctrl_ctx);
+void* usb_client_get_config(uint8 client_id);
+void usb_al_hlos_log_timer_cb(uint32 event_id);
+void usb_al_hlos_isr_ee_event(void);
+
+// ===========================================================================
+/**
+ * @function    usb_al_hlos_thread_init
+ * 
+ * @brief   This function is init usb thread.
+ *
+ * @details This function call when usb thread is share with another thread.
+ *          this function will allocate all the stuff usb_thread need.
+ * 
+ * @param   None.
+ * 
+ * @return  TRUE: when thread init successful.
+ *           FALSE: when thread init fail.
+ *
+ */
+// ===========================================================================
+void usb_al_hlos_thread_init(void* client_sig);
+
+// ===========================================================================
+/**
+ * @function  usb_handle_signal
+ * 
+ * @brief   usb thread to handle usb_signal
+ *
+ * @details pass the all the usb_signal that usb thread need to handle
+ *          and handle them all before return
+ * 
+ * @param   client_ctx  - [IN]  usb_ctx relate to the client
+ *
+ * 
+ * @return  None
+ * 
+ */
+// ===========================================================================
+void usb_handle_signal(uint32 client_sig);
+
+// ===========================================================================
+/**
+ * @function    usb_al_hlos_create_thread
+ * 
+ * @brief   This function is create usb thread.
+ *
+ * @details This function create usb thread and signal. For independent usb
+ * 
+ * @param   None.
+ * 
+ * @return  TRUE: when thread create successful.
+ *           FALSE: when thread create fail.
+ * 
+ */
+// ===========================================================================
+boolean usb_al_hlos_create_thread(void);
+
+// ===========================================================================
+/**
+ * @function    usb_get_max_packet_sizes
+ * 
+ * @brief   return max package size base on the speed
+ *
+ * @details pass through function
+ *          return max package size base on the speed
+ * 
+ * @param   none
+ * 
+ * @return  return max packet size
+ * 
+ */
+// ===========================================================================
+uint32 usb_get_max_packet_size(void);
+
+ // ===========================================================================
+/**
+ * @function    usb_al_hlos_bulk_init
+ * 
+ * @brief   This function initializes the USB core.
+ *
+ * @details This function initializes the USB core, and set signal when
+ *          enumeration is complete. Also init usb bus interrupt
+ * 
+ * @param   speed_required   -  [IN] The maximum speed at which USB should be
+ *                            configured
+ * 
+ * @return  None.
+ * 
+ */
+// ===========================================================================
+void usb_al_hlos_bulk_init(usb_max_speed_required_t speed_required);
+
+// ===========================================================================
+/**
+ * @function    usb_al_hlos_bulk_init
+ * 
+ * @brief   return number of register client
+ *
+ * @details return number of register client (who called USB_OPEN)
+ * 
+ * @param   speed_required   -  [IN] The maximum speed at which USB should be
+ *                            configured
+ * 
+ * @return  number of register client.
+ * 
+ */
+// ===========================================================================
+ uint32 usb_client_cnt(void);
+
+// ===========================================================================
+/**
+ * @function    usb_register_client
+ * 
+ * @brief   add client_ctx to usb0_ctx
+ *
+ * @details when usb_open call, register the client_ctx from usb0_ctx
+ *          all client have unique client_id
+ * 
+ * @param   client_ctx   - [IN] Client to register
+ * 
+ * @return  status - SUCCESS (1) or FAILURE(0)
+ * 
+ */
+// ===========================================================================
+ boolean usb_register_client(client_ctx_t* client_ctx);
+
+// ===========================================================================
+/**
+  * @function    usb_send_tx
+  * 
+  * @brief   submit tx buffer to hardware
+  *
+  * @details pass through function. Submit tx buffer to FD
+  * 
+  * @param   pkt        - [IN] buffer pointer to package
+  *          len        - [IN] number of byte to send in buffer
+  *          req_id     - [IN] Debug purpose, the index of buffer to be send
+  *          client_id  - [IN] Client unique ID
+  *          cb_data    - [IN] client private data pointer
+  * @return  error_msg
+  * 
+  */
+ // ===========================================================================
+ uint32 usb_send_tx(unsigned char *pkt, uint32 len, uint32 req_id, uint32 client_id, void* cb_data);
+ uint32 usb_send_hid_report(uint32 client_id, usb_hid_bitmask_cmd_t report_mask);
+
+// ===========================================================================
+/**
+* @function    usb_send_rx
+* 
+* @brief   submit rx buffer to hardware
+*
+* @details pass through function. Submit tx buffer to FD
+* 
+* @param   pkt        - [IN] buffer pointer to package
+*          len        - [IN] size of the buffer
+*          req_id     - [IN] Debug purpose, the index of buffer to be send
+*          client_id  - [IN] Client unique ID
+*          cb_data    - [IN] client private data pointer
+* @return  error_msg
+* 
+*/
+// ===========================================================================
+uint32 usb_send_rx(unsigned char *pkt, uint32 len, uint32 req_id, uint32 client_id, void* cb_data);
+
+
+// ===========================================================================
+/**
+* @function  usb_internal_close
+*
+* @brief   USB return all the rx, tx buffer back to client, and dealloc cli_ctx
+*
+* @details Client call usb_close to cancel all the transfer and return all the
+*          buffer back through rx, tx callback. After return all the buffer,
+*          destroy client_ctx and trigger event_cb with USB_EVENT_CLOSE_COMPLETE
+* 
+* @param   client_ctx  - [IN]  usb_ctx relate to the client
+* 
+* 
+* @return  TRUE,  if successful
+*          FALSE, if fail
+*/
+// ===========================================================================
+boolean usb_internal_close(client_ctx_t* client_ctx);
+
+// ===========================================================================
+/**
+* @function    usb_return_buffer
+* 
+* @brief   This function return all rx and tx buffer between client & usb
+*
+* @details This function return all rx and tx buffer between client & usb.
+*          First return all buffer pending in hardware, then return the buffer
+*          in the buffer queue
+* 
+* @param   client_ctx
+* 
+* @return  none
+* 
+*/
+// ===========================================================================
+void usb_return_buffer(client_ctx_t* client_ctx);
+
+
+// ===========================================================================
+/**
+* @function    usb_shutdown
+* 
+* @brief   shutdown the usb_hardware, log.
+*
+* @details This will shutdown usb_hardware, usb bus event, log,
+*          but will keep client_ctx and usb0_ctx, vbus, and usb_thread stuff          
+*          Call usb_al_hlos_bulk_init to restore usb
+* @param   none
+* 
+* @return  none
+* 
+*/
+ // ===========================================================================
+void usb_shutdown(void);
+
+// ===========================================================================
+/**
+* @function    usb_check_enum
+* 
+* @brief   Return if usb is already enumerate
+* 
+* @param   None
+*
+* @return  boolean is_enumerated
+* 
+*/
+// ===========================================================================
+boolean usb_check_enum(void);
+
+void usb_al_hlos_isr_vbus_event(uint32 vbus_high);
+#endif /* USB_AL_HLOS_BULK_H */
+
