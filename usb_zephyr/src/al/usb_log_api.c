@@ -129,7 +129,7 @@ void usb_log_process_cmd(uint8* buf_ptr, uint32 size)
     case USB_LOG_CMD__DISABLE:
     {      
       log_ctx->is_logging_enabled = FALSE;
-      timer_stop(&log_ctx->timer, T_MSEC, NULL);
+      //timer_stop(&log_ctx->timer, T_MSEC, NULL);
       //log_handler_set_transport_mode(LOG_HANDLER_TRANSPORT_MODE__UART);
     }
     break;
@@ -138,7 +138,7 @@ void usb_log_process_cmd(uint8* buf_ptr, uint32 size)
     { 
       //log_handler_set_transport_mode(LOG_HANDLER_TRANSPORT_MODE__USB);
       log_ctx->is_logging_enabled = TRUE;
-      timer_set_64(&log_ctx->timer, USB_LOG_TIMER_MS,  0, T_MSEC);
+      //timer_set_64(&log_ctx->timer, USB_LOG_TIMER_MS,  0, T_MSEC);
     }
     break;
 
@@ -182,7 +182,7 @@ void usb_log_close(void)
   if(log_ctx)
   {
     usb_api()->usb_close(log_ctx->usb_ctx);
-    timer_undef(&log_ctx->timer);
+    //timer_undef(&log_ctx->timer);
     usb_fn_mem_util()->usb_free((void**)&log_ctx->tx_buff);
     usb_fn_mem_util()->usb_free((void**)&log_ctx->rx_buff);
     usb_fn_mem_util()->usb_free((void**)&log_ctx);
@@ -201,5 +201,5 @@ void usb_log_open(void)
   USB_ASSERT(log_ctx->rx_buff = (uint8*)usb_fn_mem_util()->usb_malloc_uncached(USB_LOG_RX_BUFF_SIZE));
   USB_ASSERT(log_ctx->tx_buff = (uint8*)usb_fn_mem_util()->usb_malloc_uncached(USB_LOG_TX_BUFF_SIZE));
 
-  timer_def_osal(&log_ctx->timer, NULL, TIMER_FUNC1_CB_TYPE, usb_al_hlos_log_timer_cb, NULL);
+  //timer_def_osal(&log_ctx->timer, NULL, TIMER_FUNC1_CB_TYPE, usb_al_hlos_log_timer_cb, NULL);
 }

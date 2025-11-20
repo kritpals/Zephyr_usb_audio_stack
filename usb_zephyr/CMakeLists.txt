@@ -19,6 +19,7 @@ zephyr_include_directories(
 zephyr_library_sources(
     src/al/usb_al_zephyr.c
     src/al/usb_log_api.c
+    src/common/usb_api_fn_tbl.c
     src/common/usb_fn_tbl.c
     src/common/usb_mem_util_zephyr.c
     src/common/usb_log.c

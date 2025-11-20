@@ -32,7 +32,9 @@
 
 
 LOG_MODULE_REGISTER(usb_al, LOG_LEVEL_DBG);
+int usb_zephyr_init(void);
 
+SYS_INIT(usb_zephyr_init, APPLICATION, CONFIG_QC_CHGFW_USB_DRIVERS);
 //----------------------------------------------------------------------------
 // Preprocessor Definitions and Constants
 //----------------------------------------------------------------------------
@@ -942,6 +944,14 @@ void usb_thread_init(void* sig_ptr)
   usb_fn_mem_util()->usb_mem_init();
   usb_fn_al()->usb_ctx_init();
   usb_log_buffer_init(&usb0_ctx->log_ptr);
+}
+
+int usb_zephyr_init(void)
+{
+  /* Single-threaded: do not create a dedicated USB thread */
+  k_event_init(&usb_events);
+  usb_api()->usb_thread_init(&usb_events);
+  return TRUE;
 }
 
 boolean usb_create_thread(void)

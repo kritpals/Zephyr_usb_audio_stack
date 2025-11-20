@@ -70,7 +70,7 @@ static usb_mem_ctx_t usb_mem;
 
 void usb_mem_barrier(void)
 {
-  barrier_dmem_fence_full();
+  //TODO: barrier_dmem_fence_full();
 }
 
 void* usb_mem_attr_uncached(void* ptr)

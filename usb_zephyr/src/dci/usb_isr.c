@@ -198,11 +198,11 @@ void usb_isr_ee_enable(boolean enable)
 {
   if (enable)
   {
-    CPEInterruptController_EnableInterrupt(USB_CTRL_EE1_IRQ);
+    //TODO: CPEInterruptController_EnableInterrupt(USB_CTRL_EE1_IRQ);
   }
   else
   {
-    CPEInterruptController_DisableInterrupt(USB_CTRL_EE1_IRQ);
+    //TODO: CPEInterruptController_DisableInterrupt(USB_CTRL_EE1_IRQ);
   }
 }
 
@@ -227,13 +227,13 @@ void usb_isr_usbphy_enable(boolean enable)
 {
   if (enable)
   {
-    CPEInterruptController_EnableInterrupt(USB_CTRL_HSPHY_IRQ);
-    CPEInterruptController_EnableInterrupt(USB_PHY_DPSE_IRQ);
+    //TODO: CPEInterruptController_EnableInterrupt(USB_CTRL_HSPHY_IRQ);
+    //CPEInterruptController_EnableInterrupt(USB_PHY_DPSE_IRQ);
   }
   else
   {
-    CPEInterruptController_DisableInterrupt(USB_CTRL_HSPHY_IRQ);
-    CPEInterruptController_DisableInterrupt(USB_PHY_DPSE_IRQ);
+    //CPEInterruptController_DisableInterrupt(USB_CTRL_HSPHY_IRQ);
+    //CPEInterruptController_DisableInterrupt(USB_PHY_DPSE_IRQ);
   }
 }
 
@@ -258,11 +258,11 @@ void usb_isr_pwr_enable(boolean enable)
 {
   if (enable)
   {
-    CPEInterruptController_EnableInterrupt(USB_CTRL_POWER_EVENT_IRQ);
+    //TODO: CPEInterruptController_EnableInterrupt(USB_CTRL_POWER_EVENT_IRQ);
   }
   else
   {
-    CPEInterruptController_DisableInterrupt(USB_CTRL_POWER_EVENT_IRQ);
+    //CPEInterruptController_DisableInterrupt(USB_CTRL_POWER_EVENT_IRQ);
   }
 }
 
@@ -311,7 +311,7 @@ void usb_isr_ee1_handle(void* ctx)
 {
   usb_isr_ctx_t* isr_ctx = (usb_isr_ctx_t*)ctx;
   usb_mips_start(usb_mips__usb_intr_isr);
-  CPEInterruptController_ClearPending(USB_CTRL_EE1_IRQ);
+  //TODO: CPEInterruptController_ClearPending(USB_CTRL_EE1_IRQ);
   if (isr_ctx && isr_ctx->usb_events)
   {
     if(usb_fn_isr()->usb_isr_enqueue_ee_event(isr_ctx))
@@ -346,7 +346,7 @@ void usb_isr_pwr_handle(void* ctx)
   usb_isr_ctx_t* isr_ctx = (usb_isr_ctx_t*)ctx;
   uint32 pwr_isr_event = HWIO_USBCTL_PWR_EVNT_IRQ_STAT_IN;
   
-  CPEInterruptController_ClearPending(USB_CTRL_POWER_EVENT_IRQ);
+  //TODO: CPEInterruptController_ClearPending(USB_CTRL_POWER_EVENT_IRQ);
   if (pwr_isr_event)
   {
     HWIO_USBCTL_PWR_EVNT_IRQ_STAT_OUT(pwr_isr_event);
@@ -413,7 +413,7 @@ void usb_isr_hsphy_handle(void* ctx)
   USB_ASSERT(isr_ctx && isr_ctx->dci_ctx);
   dci_ctx = (usb_dci_ctx_t*)isr_ctx->dci_ctx;
 
-  CPEInterruptController_ClearPending(USB_CTRL_HSPHY_IRQ);
+  //CPEInterruptController_ClearPending(USB_CTRL_HSPHY_IRQ);
   //led_chg_mode(LED_BLUE, LED_MODE_BLINK);
   //led_start(LED_BLUE);
 
@@ -461,8 +461,8 @@ boolean usb_isr_lpm_init(boolean is_l1_enable)
 {
   uint32 pwr_isr_event = HWIO_USBCTL_PWR_EVNT_IRQ_STAT_IN;
  
-  CPEInterruptController_DisableInterrupt(USB_CTRL_POWER_EVENT_IRQ);
-  CPEInterruptController_ClearPending(USB_CTRL_POWER_EVENT_IRQ);
+  //CPEInterruptController_DisableInterrupt(USB_CTRL_POWER_EVENT_IRQ);
+  //CPEInterruptController_ClearPending(USB_CTRL_POWER_EVENT_IRQ);
 
   HWIO_USBCTL_PWR_EVNT_IRQ_STAT_OUT(pwr_isr_event);
   HWIO_USBCTL_PWR_EVNT_IRQ_MASK_OUT(0);
@@ -470,7 +470,7 @@ boolean usb_isr_lpm_init(boolean is_l1_enable)
   HWIO_USBCTL_PWR_EVNT_IRQ_MASK_OUTM(HWIO_USBCTL_PWR_EVNT_IRQ_MASK_LPM_OUT_L2_IRQ_MASK_BMSK,
                                  0x1 << HWIO_USBCTL_PWR_EVNT_IRQ_MASK_LPM_OUT_L2_IRQ_MASK_SHFT);
 
-  CPEInterruptController_EnableInterrupt(USB_CTRL_POWER_EVENT_IRQ);
+  //CPEInterruptController_EnableInterrupt(USB_CTRL_POWER_EVENT_IRQ);
   return 0;
 }
 
@@ -496,8 +496,8 @@ None.
 ===========================================================================*/
 boolean usb_isr_ee_init(usb_isr_ctx_t* isr_ctx)
 {
-  CPEInterruptController_DisableInterrupt(USB_CTRL_EE1_IRQ);
-  CPEInterruptController_ClearPending(USB_CTRL_EE1_IRQ);
+  //CPEInterruptController_DisableInterrupt(USB_CTRL_EE1_IRQ);
+  //CPEInterruptController_ClearPending(USB_CTRL_EE1_IRQ);
 
   usb_fn_isr()->usb_event_queue_init(&isr_ctx->ee_dsr_queue, EVENT_BUFFER_SIZE/sizeof(usb_event_t));
 
@@ -538,12 +538,13 @@ None.
 ===========================================================================*/
 boolean usb_isr_pwr_init(usb_isr_ctx_t* isr_ctx)
 {
+#ifdef USB_KW_CONST_RESULT
   CPEInterruptController_DisableInterrupt(USB_CTRL_POWER_EVENT_IRQ);
   CPEInterruptController_ClearPending(USB_CTRL_POWER_EVENT_IRQ);
 
   usb_fn_isr()->usb_event_queue_init(&isr_ctx->pwr_dsr_queue, USB_PWR_DSR_QUEUE_SIZE);
 
-#ifdef USB_KW_CONST_RESULT
+
     //condition always yield the same result and causes an unreachable code
 
   if(CPEInterruptController_RegisterInterrupt(USB_CTRL_POWER_EVENT_IRQ, usb_fn_isr()->usb_isr_pwr_handle, isr_ctx, 
@@ -581,8 +582,9 @@ boolean usb_isr_pwr_init(usb_isr_ctx_t* isr_ctx)
 
   CPEInterruptController_RegisterInterrupt(USB_PHY_DPSE_IRQ, usb_fn_isr()->usb_isr_dpse_handle, isr_ctx, 
     CPEINT_SETTRIGGER(CPEINT_TRIGGER_RISING_EDGE) | CPEINT_SETPRIORITY(CPEINT_PRIORITY_MEDIUM));
-    */
+    
   CPEInterruptController_DisableInterrupt(USB_PHY_DPSE_IRQ);
+  */
 #endif
   return TRUE;
 }
@@ -611,7 +613,7 @@ uint32 usb_isr_ee_uninit(usb_isr_ctx_t* isr_ctx)
 
   USB_ASSERT(dci_ctx);
 
-  error_code = CPEInterruptController_DeregisterInterrupt(USB_CTRL_EE1_IRQ);
+  //error_code = CPEInterruptController_DeregisterInterrupt(USB_CTRL_EE1_IRQ);
   
 #ifdef USB_KW_CONST_RESULT
       //condition always yield the same result and causes an unreachable code
@@ -678,9 +680,9 @@ uint32 usb_isr_pwr_uninit(usb_isr_ctx_t* isr_ctx)
     return error_code;
   }
 #else
-  CPEInterruptController_DeregisterInterrupt(USB_CTRL_POWER_EVENT_IRQ);  
-  CPEInterruptController_DeregisterInterrupt(USB_CTRL_HSPHY_IRQ);  
-  CPEInterruptController_DeregisterInterrupt(USB_PHY_DPSE_IRQ);  
+ // CPEInterruptController_DeregisterInterrupt(USB_CTRL_POWER_EVENT_IRQ);  
+ // CPEInterruptController_DeregisterInterrupt(USB_CTRL_HSPHY_IRQ);  
+ // CPEInterruptController_DeregisterInterrupt(USB_PHY_DPSE_IRQ);  
 #endif
 
   if (NULL != (isr_ctx->pwr_dsr_queue).dsr_save_event)
