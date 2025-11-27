@@ -465,7 +465,7 @@ void usb_dci_hw_init(usb_dci_ctx_t* dci_ctx, usb_max_speed_required_t* max_speed
 
 #endif
 
-  //11. USBCTL_DWC_USB3_GTXFIFOSIZ_REGS_p_GTXFIFOSIZ0[0] – setup TX FIFO start 
+  //11. USBCTL_DWC_USB3_GTXFIFOSIZ_REGS_p_GTXFIFOSIZ0[0] ï¿½ setup TX FIFO start 
   //addr and depth
   HWIO_USBCTL_GTXFIFOSIZ_REGS_p_GTXFIFOSIZ0_OUTI(0, 0x04DA0014);
 
@@ -509,12 +509,12 @@ void usb_dci_hw_init(usb_dci_ctx_t* dci_ctx, usb_max_speed_required_t* max_speed
   // Power Down Scale(0x0010000), Port Capability Dir - Device(0x00002008), Scaledown(0x000000030), DISABLE SCRAMBLE(0x00000008) 
   HWIO_USBCTL_GCTL_OUT(0x00102008);  //TODO BOLT_ADD -HWIO_USBCTL_GCTL_SCALEDOWN_BMSK document
   
-  //26. USBCTL_DWC_USB3_DCFG – enable LPM
+  //26. USBCTL_DWC_USB3_DCFG ï¿½ enable LPM
   // LPMCAP(0x400000), No. of receive buffers Nump (0x80000)
   usb_fn_dci()->usb_dci_configure_device_mode(dci_ctx->is_l1_feature_enabled, *max_speed);
   //HWIO_USBCTL_DCFG_OUT(0x480000);
 
-  //27. USBCTL_DWC_USB3_DEVTEN – L1/L2 event
+  //27. USBCTL_DWC_USB3_DEVTEN ï¿½ L1/L2 event
   // (0x1247) VENDEVTSTRCVDEN, ERRTICERREVTEN, U3L2L1SuspEn, CONNECTDONEEVTEN, USBRSTEVTEN, DISSCONNEVTEN
   HWIO_USBCTL_DEVTEN_OUT(
     HWIO_USBCTL_DEVTEN_VENDEVTSTRCVDEN_BMSK
@@ -1731,7 +1731,7 @@ static void usb_dci_handle_transfer_complete(usb_dci_ctx_t* dci_ctx, usb_event_d
  *      and any primed transactions will be canceled by the device controller. 
  *      
  *      The DCD must perform the following tasks when a reset is received:
- *       1. If a control transfer is still in progress, complete it and get the core into the “Setup a Control-Setup TRB / Start Transfer” state
+ *       1. If a control transfer is still in progress, complete it and get the core into the ï¿½Setup a Control-Setup TRB / Start Transferï¿½ state
  *       2. Issue a DEPENDXFER command for any active transfers (except for the default control endpoint0).
  *       3. Issue a DEPCSTALL (ClearStall) command for any endpoint that was put into STALL mode prior to the USB Reset.
  *       4. Set DevAddr to 0. 
@@ -1789,9 +1789,9 @@ void usb_dci_handle_usb_reset(usb_dci_ctx_t* dci_ctx)
  *       1. Read DSTS register to obtain the connection speed
  *       2. Program the RAMClkSel field to select the correct clock for the RAM clock domain. This field is
  *           reset to 0 after USB reset, so it must be reprogrammed each time on Connect Done.
- *       3. Issue a DEPCFG command (with Config Action set to “Modify”) for physical endpoints 0 & 1 with a max packet size
+ *       3. Issue a DEPCFG command (with Config Action set to ï¿½Modifyï¿½) for physical endpoints 0 & 1 with a max packet size
  *           based on speed.
- *       4. Depending on the connected speed, write to the other PHY’s control register to suspend it. 
+ *       4. Depending on the connected speed, write to the other PHYï¿½s control register to suspend it. 
  *       5. (optional) Based on the new MaxPacketSize of IN endpoint 0, software may choose to re-allocate
  *           the TX FIFO sizes by writing to these registers.
  * 
@@ -2666,8 +2666,8 @@ static uint32 usb_dci_submit_trb_data(usb_dci_ctx_t* dci_ctx, uint8 ep, uint8 di
 
   if(DCI_OK != usb_fn_dci()->usb_dci_write_ep_cmd(dci_ctx, ep, dir, &start_cmd))
   {
-    USB_ULOG_3(DBG_E_LOG,"write ep cmd failure, ep %d, dir %d, idx %d", 
-      ep, dir, trb_ring_ptr->trb_submit_idx);
+    //USB_ULOG_3(DBG_E_LOG,"write ep cmd failure, ep %d, dir %d, idx %d", 
+    //  ep, dir, trb_ring_ptr->trb_submit_idx);
     USB_LOG_ERR_2(log_usb_dci_submit_trb_data__write_ep_cmd_failure, ep, dir);
     return (DCI_ERROR);
   }
@@ -2679,7 +2679,7 @@ static uint32 usb_dci_submit_trb_data(usb_dci_ctx_t* dci_ctx, uint8 ep, uint8 di
               >> HWIO_USBCTL_DEPCMDPAR2_REGS_p_DEPCMD_COMMANDPARAM_SHFT;
 
     trb_ring_ptr->xfer_res_idx = (uint8)(cmd_params & USB_EP_XFER_RSC_INDEX_BMSK);
-    USB_ULOG_3(ENG_QUSB_LOG, "resource index %d, ep %u, dir %u", trb_ring_ptr->xfer_res_idx, ep, dir);
+    //USB_ULOG_3(ENG_QUSB_LOG, "resource index %d, ep %u, dir %u", trb_ring_ptr->xfer_res_idx, ep, dir);
   }
 
   return(DCI_OK);

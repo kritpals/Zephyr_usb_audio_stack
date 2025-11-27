@@ -61,7 +61,7 @@ typedef struct
   client_ctx_t* client_ctx[USB_COMP_SIZE_MAX];
   usb_fd_ctx_t* fd_ctx;
   usb_isr_ctx_t isr_ctx;
-  usb_log_type* log_ptr;
+  //usb_log_type* log_ptr;
 } usb0_ctx_t;
 
 typedef struct usb_fn_tbl_al
@@ -467,7 +467,7 @@ void usb_ctx_init(void)
   usb0_ctx->isr_ctx.pwr_handle    = usb_fn_al()->usb_al_hlos_isr_pwr_event;  
   usb0_ctx->isr_ctx.vbus_handle   = usb_fn_al()->usb_al_hlos_isr_vbus_event;
   usb0_ctx->notify                = usb_fn_al()->usb_client_notification;
-  usb0_ctx->log_ptr               = NULL;
+  //usb0_ctx->log_ptr               = NULL;
 
   USB_ASSERT(usb_params = (usb_drv_params_t*)usb_fn_mem_util()->usb_malloc(sizeof(usb_drv_params_t)));
 
@@ -583,7 +583,7 @@ void usb_al_hlos_bulk_init(usb_max_speed_required_t speed_required)
     USB_ASSERT(0);
   }
 
-  usb_log_buffer_init(&(usb0_ctx->log_ptr));
+  //usb_log_buffer_init(&(usb0_ctx->log_ptr));
 
   usb_fn_util()->usb_os_spinlock_lock();
 
@@ -905,7 +905,7 @@ void usb_handle_signal(uint32 client_sig)
   if (usb0_ctx->fd_ctx && (client_sig & USB_LOG_TIMER_EXP_FLAG))
   {
     USB_OS_SAFE_ENTER();
-    usb_log_read_send_ulog();
+    //usb_log_read_send_ulog();
     USB_OS_SAFE_LEAVE();
   }
 }
@@ -943,7 +943,7 @@ void usb_thread_init(void* sig_ptr)
 
   usb_fn_mem_util()->usb_mem_init();
   usb_fn_al()->usb_ctx_init();
-  usb_log_buffer_init(&usb0_ctx->log_ptr);
+  //usb_log_buffer_init(&usb0_ctx->log_ptr);
 }
 
 int usb_zephyr_init(void)
@@ -1003,5 +1003,5 @@ usb_fn_tbl_al_t fn_tbl_al =
   usb_internal_close,
   usb_thread_entry,
   usb_create_thread,
-  usb_log_read_send_ulog,
+  NULL, //usb_log_read_send_ulog,
 };

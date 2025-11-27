@@ -7,18 +7,10 @@
 zephyr_library()
 
 # Include directories
-zephyr_include_directories(
-    inc
-    src/al
-    src/common
-    src/dcd
-    src/dci
-    src/func
-)
 
 zephyr_library_sources(
     src/al/usb_al_zephyr.c
-    src/al/usb_log_api.c
+    #src/al/usb_log_api.c
     src/common/usb_api_fn_tbl.c
     src/common/usb_fn_tbl.c
     src/common/usb_mem_util_zephyr.c
@@ -35,3 +27,8 @@ zephyr_library_sources(
     src/func/usb_fd.c
     src/func/usb_hid_fd.c
 )
+
+zephyr_include_directories(inc)
+
+#require for logging.
+zephyr_include_directories(../../include/battman)
