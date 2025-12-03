@@ -165,6 +165,8 @@ typedef enum
   USB_IFC_ID_AUDIO_STREAMING_SPEAKER,
   USB_IFC_ID_HID,
   USB_IFC_ID_DFU,
+  USB_IFC_ID_CDC_CONTROL, //Serial control
+  USB_IFC_ID_CDC_DATA, //Serial data
   // Add new interface IDs here
   USB_IFC_ID_MAX
 } usb_ifc_id;

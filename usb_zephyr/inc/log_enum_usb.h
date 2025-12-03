@@ -214,6 +214,33 @@ typedef enum usb_err_log
   log_usb_dci_submit_trb_data__next_uf_D_curr_uf_D,
   //CLIENT_CTX----------------------------------------------------------------------------------------------------------
   log_usb_cli_wrap_report__hid_fail__drop_cnt_D,
+
+  //CDC
+  log_cdc_app_init__start,
+  log_cdc_app_init__open_ctrl_failed,
+  log_cdc_app_init__open_data_failed,
+  log_cdc_app_init__success,
+  log_cdc_rx_callback__len,
+  log_cdc_rx_callback__data_received,
+  log_cdc_rx_callback__error,
+  log_cdc_event_callback__event,
+  log_cdc_event__enumeration_complete,
+  log_cdc_event__disconnected,
+  log_cdc_event__unknown_event,
+  log_cdc_tx_callback__len,
+  log_cdc_tx_callback__success,
+  log_cdc_tx_callback__error,
+  log_cdc_app_init__set_params_failed,
+  log_cdc_app_send__not_connected,
+  log_cdc_app_send__buffer_too_large,
+  log_cdc_app_send__null_ctx,
+  log_cdc_acm__set_line_coding,
+  log_cdc_acm__get_line_coding,
+  log_cdc_acm__set_ctrl_line_state,
+  log_cdc_acm__unknown_request,
+  log_cdc_acm__unknown_set_request,
+  log_cdc_acm__unknown_get_request,
+  
   //----------------------------------------------------------------------------------------------------------
 
 } usb_err_log_t;

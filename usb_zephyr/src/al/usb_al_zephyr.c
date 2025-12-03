@@ -29,7 +29,7 @@
 #include "usb_fd.h"
 #include "usb_dcd_ch9.h"
 #include "usb_isr.h"
-
+#include "usb_cdc_acm_fd.h"
 
 LOG_MODULE_REGISTER(usb_al, LOG_LEVEL_DBG);
 int usb_zephyr_init(void);
@@ -473,6 +473,7 @@ void usb_ctx_init(void)
 
   usb_fn_util()->usb_get_acdb_params(usb_params);
 
+  //TODO: Needed for audio code.
   //usb0_ctx->dev_cfg.product_str = usb_fn_al()->usb_get_str_dsc_from_acdb_str(usb_params->product_str_len, usb_params->product_str);
   //usb0_ctx->dev_cfg.manuf_str   = usb_fn_al()->usb_get_str_dsc_from_acdb_str(usb_params->manuf_str_len, usb_params->manuf_str);
   usb0_ctx->dev_cfg.feature_flags = usb_params->feature_flags;
@@ -615,8 +616,31 @@ void usb_al_hlos_bulk_init(usb_max_speed_required_t speed_required)
   usb_fn_isr()->usb_isr_init(&usb0_ctx->isr_ctx);
 
   LOG_INF("USB init complete");
-
+  
+  uint32_t ret;
+  const char* test_msg = "Hello from CDC-ACM!\r\n";
+  //Serial communication driver init
+  ret = cdc_app_init();
+  if (USB_SUCCESS != ret) {
+        LOG_ERR("cdc init failed!");
+        return;
+  }
+  
   usb_fn_util()->usb_os_spinlock_unlock();
+
+  //Assuming device is connected. 
+      /* Send test message */
+  ret = cdc_app_send_data((const uint8_t*)test_msg, strlen(test_msg));
+  if (ret != USB_SUCCESS) {
+      LOG_ERR("cdc send data failed");
+      return;
+  }
+  
+  /* Main loop - handle USB events */
+  while (1) {
+      usb_handle_signal(0);
+      /* Add your application logic here */
+  }
 }
 
 uint32 usb_client_cnt(void)
@@ -941,6 +965,7 @@ void usb_thread_init(void* sig_ptr)
 
   usb_fn_util()->usb_os_spinlock_init();
 
+  //TODO: memory needed for Audio code.
   usb_fn_mem_util()->usb_mem_init();
   usb_fn_al()->usb_ctx_init();
   //usb_log_buffer_init(&usb0_ctx->log_ptr);

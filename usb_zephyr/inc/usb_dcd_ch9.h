@@ -139,7 +139,16 @@ typedef PACKED struct usb_setup_packet {
 #define USB_DESCTYPE_EP_COMP        (0x30)
 #define USB_DESCTYPE_BOS            (0xf)
 #define USB_DESCTYPE_DEV_CAP        (0x10) // device capability 
+/** Class-Specific Descriptor Types as defined by
+ *  USB Common Class Specification
+ */
 
+//TODO: rename them as per above defines
+#define USB_DESC_CS_DEVICE		0x21
+#define USB_DESC_CS_CONFIGURATION	0x22
+#define USB_DESC_CS_STRING		0x23
+#define USB_DESC_CS_INTERFACE		0x24
+#define USB_DESC_CS_ENDPOINT		0x25
 /**
  * @ref HID 1.11 clause 7.1
  */

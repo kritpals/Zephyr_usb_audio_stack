@@ -77,6 +77,8 @@
 #include "usb_common.h"
 #include "usb_log.h"
 #include "usb_util.h"
+#include "usb_cdc_acm_fd.h"
+
 //#include "usb_audio_class_30.h"
 
 /*----------------------------------------------------------------------------
@@ -899,7 +901,30 @@ boolean usb_fd_init(usb_fd_ctx_t** fd_ctx_ptr, usb_api_callback_t api_cb,
         ifc_ctx->fn_class.ctx =  ifc_ctx->fn_class.init(ifc_id, ifc_index, (void*) &dfu_init_cfg);
       }
       break;
-
+      case USB_IFC_ID_CDC_CONTROL:
+      {
+        ifc_ctx->fn_class.init = usb_fn_cdc()->usb_cdc_acm_init;
+        ifc_ctx->fn_class.alloc_desc = usb_fn_cdc()->usb_cdc_acm_alloc_desc;
+        ifc_ctx->fn_class.set_cfg = usb_fn_cdc()->usb_cdc_acm_set_cfg;
+        ifc_ctx->fn_class.handle_set_req = usb_fn_cdc()->usb_cdc_acm_handle_set_req;
+        ifc_ctx->fn_class.handle_get_req = usb_fn_cdc()->usb_cdc_acm_handle_get_req;
+        ifc_ctx->fn_class.deinit = usb_fn_cdc()->usb_cdc_acm_deinit; 
+        ifc_ctx->fn_class.notify_speed = usb_fn_cdc()->usb_cdc_acm_notify_speed;
+        ifc_ctx->fn_class.ctx = ifc_ctx->fn_class.init(ifc_id, ifc_index, NULL);
+      }
+      break;
+      case USB_IFC_ID_CDC_DATA:
+      {
+        /* CDC Data interface is created together with Control interface */
+        /* Skip initialization as it's handled by CDC_CONTROL case */
+        /* The context is shared with the control interface */
+        if (ifc_index > 0 && fd_ctx->ifc_ctx[ifc_index - 1].ifc_id == USB_IFC_ID_CDC_CONTROL) {
+          ifc_ctx->fn_class.ctx = fd_ctx->ifc_ctx[ifc_index - 1].fn_class.ctx;
+          ifc_ctx->fn_class.set_cfg = usb_fn_cdc()->usb_cdc_acm_set_cfg;
+          ifc_ctx->fn_class.notify_speed = usb_fn_cdc()->usb_cdc_acm_notify_speed;
+        }
+      }
+      break;
       default:
         USB_LOG_ERR_1(log_usb_fd_init__unknown_ifc_id_D, ifc_id);
     }
