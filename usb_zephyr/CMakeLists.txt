@@ -10,7 +10,6 @@ zephyr_library()
 
 zephyr_library_sources(
     src/al/usb_al_zephyr.c
-    #src/al/usb_log_api.c
     src/al/usb_cdc_acm_class.c
     src/func/usb_cdc_acm_fd.c
     src/common/usb_api_fn_tbl.c
@@ -23,7 +22,7 @@ zephyr_library_sources(
     src/dci/usb_dci.c
     src/dci/usb_dci_9410.c
     src/dci/usb_dci_ulpi.c
-    src/dci/usb_isr.c
+    src/dci/usb_isr_zephyr.c
     src/func/usb_bulk_fd.c
     src/func/usb_dfu_fd.c
     src/func/usb_fd.c

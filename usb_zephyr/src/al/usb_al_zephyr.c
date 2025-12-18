@@ -638,7 +638,15 @@ void usb_al_hlos_bulk_init(usb_max_speed_required_t speed_required)
   
   /* Main loop - handle USB events */
   while (1) {
+       //start polling for ISR/IRQ
+      usb_fn_isr()->usb_isr_poll_events(&usb0_ctx->isr_ctx);
+
       usb_handle_signal(0);
+      
+      //Start polling for events.
+      usb_fn_fd()->usb_fd_poll(usb0_ctx->fd_ctx);
+
+      usb_fn_util()->usb_delay_ms(1);
       /* Add your application logic here */
   }
 }
